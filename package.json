@@ -1,0 +1,43 @@
+{
+  "name": "meow-memory",
+  "version": "0.1.0",
+  "description": "Cross-session project memory for DeepSeek Harness: PROJECT.md snapshot injected into the first user message (cache-friendly), memory_remember tool, and automatic reflection after ReAct tasks.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "agent-memory",
+    "project-memory"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Phant0Meow/meow-memory.git"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "test": "node test.mjs",
+    "link-workspace": "powershell -ExecutionPolicy Bypass -File scripts/link-workspace.ps1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
