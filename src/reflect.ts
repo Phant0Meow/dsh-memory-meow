@@ -1,0 +1,180 @@
+/**
+ * meow-memory v2 — ReAct 任务结束后的自动反思。
+ *
+ * 触发：连续 react（工具）轮 ≥ reflectTurns（默认 7）后，在该轮结束时触发一次；
+ * 单轮简单工具调用不触发。顶层会话、本 turn 未反思过、最后工具非 memory_ 系列。
+ * 反思消息三块：
+ *   1) 记忆清单（fact/lesson 短条目、原话保留、project/topic 规则）；
+ *   2) 话题偏离信号（keyword 聚类余弦，只提醒不拍板）；
+ *   3) 最相关 topic 当前版本底稿（模型重写前先看它，防无底稿覆盖）。
+ */
+
+import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
+import type { Doc } from './bm25.js'
+import { topicDrift } from './bm25.js'
+import { getDb } from './db.js'
+
+const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
+
+/** 反思消息识别标记（防同 turn 重复反思）。 */
+export const REFLECT_MARKER = '[meow-memory-reflect]'
+
+export function scanTurn(events: readonly unknown[]): {
+  sawToolCall: boolean
+  lastToolName?: string
+  sawReflect: boolean
+  turnText: string
+} {
+  let startIdx = 0
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as { type?: string }
+    if (e?.type === 'turn/start') {
+      startIdx = i
+      break
+    }
+  }
+  let sawToolCall = false
+  let lastToolName: string | undefined
+  let sawReflect = false
+  const texts: string[] = []
+  for (let i = startIdx; i < events.length; i++) {
+    const e = events[i] as {
+      type?: string
+      data?: {
+        source?: { kind?: string; plugin?: string }
+        content?: Array<{ type?: string; text?: string }>
+        message?: { content?: Array<{ type?: string; name?: string; text?: string }> }
+      }
+    }
+    if (e?.type === 'user/message') {
+      const src = e.data?.source
+      if (src?.kind === 'plugin' && src.plugin === 'meow-memory') sawReflect = true
+      else {
+        for (const b of e.data?.content ?? []) if (b.type === 'text' && b.text) texts.push(b.text)
+      }
+    } else if (e?.type === 'assistant/message') {
+      for (const block of e.data?.message?.content ?? []) {
+        if (block.type === 'tool-call') {
+          sawToolCall = true
+          lastToolName = block.name
+        } else if (block.type === 'text' && block.text) {
+          texts.push(block.text)
+        }
+      }
+    }
+  }
+  return { sawToolCall, lastToolName, sawReflect, turnText: texts.join('\n').slice(-2000) }
+}
+
+/**
+ * 从事件流尾部向前数「连续工具轮」：每个 turn 内含 tool-call（且非 memory_ 系列）
+ * 计一轮；遇到非工具轮或记忆标记（meow-memory 消息 / memory_ 工具调用）所在轮即停。
+ * 用户拍板：连续 react 7 轮以上才在结束时触发反思，简单一轮工具调用不触发。
+ */
+export function consecutiveToolTurns(events: readonly unknown[]): number {
+  let count = 0
+  let i = events.length - 1
+  while (i >= 0) {
+    let start = -1
+    for (let j = i; j >= 0; j--) {
+      if ((events[j] as { type?: string }).type === 'turn/start') {
+        start = j
+        break
+      }
+    }
+    const segStart = start === -1 ? 0 : start
+    let sawTool = false
+    let sawMemoryMark = false
+    for (let j = segStart; j <= i; j++) {
+      const e = events[j] as {
+        type?: string
+        data?: {
+          source?: { kind?: string; plugin?: string }
+          message?: { content?: Array<{ type?: string; name?: string }> }
+        }
+      }
+      if (e?.type === 'user/message' && e.data?.source?.kind === 'plugin' && e.data.source.plugin === 'meow-memory') {
+        sawMemoryMark = true
+      } else if (e?.type === 'assistant/message') {
+        for (const b of e.data?.message?.content ?? []) {
+          if (b.type === 'tool-call' && typeof b.name === 'string') {
+            if (b.name.startsWith('memory_')) sawMemoryMark = true
+            else sawTool = true
+          }
+        }
+      }
+    }
+    if (sawMemoryMark || !sawTool) break
+    count++
+    i = segStart - 1
+  }
+  return count
+}
+
+const BASE_PROMPT = [
+  '[记忆反思]',
+  '从上次整理记忆到现在，中间这么多轮次里，有值得跨会话记住的新记忆吗？',
+  '如果有，按需调用 memory_remember / memory_update；没有则回复"无需记忆"。',
+  '',
+  '【一】添加记忆条目',
+  '如存在以下情况，你可以酌情添加记忆条目：',
+  '- 用户的交流/工作/代码偏好（user）；项目特定偏好进 project。',
+  '- 项目相关的关键信息（project：必须给项目名）。project 子标签（subcategory）：',
+  '  overview=项目目标概述 / structure=项目结构 / decisions=技术决策 /',
+  '  quotes=用户原话 / ops=部署与数据 / todo=进行中事项（todo 完成时标 stale 视为 done）。',
+  '- 用户介绍项目设计思路、框架、决策理由时说的话——必须保留用户原话措辞，不要转述总结（进 project 或 lesson）；',
+  '- 重要的事实、结论或决定（fact：一句话直陈，≤60 字）；',
+  '- 犯过的错、被用户纠正的地方、多次尝试才成功的经验、踩过的坑（lesson，被纠正的一定要记，保留用户原话和 corrected 标记）；',
+  '',
+  '【二】总结话题进展',
+  '如果你们正在讨论的话题有了新的进展、新的事实、新的发展经过结果，你可以更新话题描述。',
+  '话题 topic 规则：',
+  '- 一条 topic = 一个正在进行或刚结束的讨论线索，可跨会话持续。',
+  '- 创建时用 memory_remember 写目标句（goal）与名词性标题（对象+动作，如「femGen 集成」；禁止宽泛名如"dsh 插件"）。',
+  '- 归属判断：本 turn 是否让已有 topic 的目标句更接近一步？是 → memory_update 重写该 topic（【起因经过发展结果】≤300 字，旧的没价值信息可丢弃）；否（与目标无因果关联的独立事项）→ 新建 topic。',
+  '- 完结：达成目标且连续 ≥2 会话或 ≥7 天无进展 → 标 archived；无结论久无进展 → 标 stale。',
+  '',
+  '注意：memory_remember / memory_update 调用成功后即完成，不要重复调用。',
+  '如果没有值得记住的，直接回复"无需记忆"即可，不要调用任何工具。',
+].join('\n')
+
+function formatTopicDraft(t: { title: string | null; goal: string | null; content: string; id: string }): string {
+  const parts = [`话题「${t.title ?? '(无标题)'}」当前版本（id=${t.id.slice(0, 8)}）：`]
+  if (t.goal) parts.push(`目标：${t.goal}`)
+  parts.push(t.content)
+  return parts.join('\n')
+}
+
+export function buildReflectMessage(workspace: string, turnText: string, dir = '.dsh-meow'): ReturnType<typeof createUserMessage> {
+  const db = getDb(workspace, dir)
+  const topics = db.list('topic', { status: 'active' })
+  const drift = topicDrift(
+    turnText,
+    topics.map((t) => ({
+      id: t.id,
+      level: 'topic',
+      title: t.title,
+      content: t.content,
+      keywords: t.keywords,
+      importance: t.importance,
+      created_at: t.created_at,
+    })) as Doc[],
+  )
+
+  const blocks: string[] = [REFLECT_MARKER, BASE_PROMPT]
+  if (drift.suggestsNew) {
+    blocks.push(
+      '',
+      `[关键词偏离提示] 本 turn 与现有话题「${drift.topTopic?.title ?? '?'}」的相似度仅 ${drift.topScore.toFixed(2)}，` +
+        '疑似切换到了新话题/子话题。请用上面的目标句规则判断：仍在推进旧话题目标 → 归旧话题；否则新建 topic。',
+    )
+  }
+  if (drift.topTopic) {
+    const t = topics.find((x) => x.id === drift.topTopic!.id)
+    if (t) blocks.push('', '【相关话题底稿】（重写前先读它，不要凭记忆覆盖）', formatTopicDraft(t))
+  }
+  const text = blocks.join('\n')
+  return createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE })
+}
+
+export { PLUGIN_SOURCE }

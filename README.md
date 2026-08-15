@@ -1,41 +1,43 @@
 # meow-memory 🐱📝
 
-Cross-session project memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
+Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Born from the "meow" fork — hence the name — but works on any DSH profile.
 
-**The idea**: every workspace keeps one human-readable memory file (`.dsh-meow/PROJECT.md`).
-New sessions get it injected as a **prefix of the first user message** (not the system prompt), so
-the prompt prefix — and your LLM provider's KV/context cache — stays untouched. The full file is
-injected, never truncated. When the model finishes a task (a ReAct turn that used tools), the
-plugin gently asks it to reflect and save what's worth remembering.
+**The idea**: every workspace keeps a structured memory database (`.dsh-meow/memory.db`,
+SQLite via `node:sqlite`). New sessions get the essential layers injected as a **prefix of the
+first user message** (not the system prompt), so the prompt prefix — and your LLM provider's
+KV/context cache — stays untouched. The model deep-dives into the rest on demand with
+`memory_search` / `memory_find_similar`. Each window's own agent consolidates its memories at
+night ("dream"), and only its own memories — with the window's knowledge frozen at the last
+conversation timestamp.
 
 ## ✨ Features
 
-- **Cache-friendly by design**: memory is injected as a plain user-message prefix on the
-  session's first user message — the complete memory content comes first, then the user's own
-  text. The system prompt never changes, and the snapshot is frozen for the whole session —
-  later memory updates cannot invalidate the request prefix.
-- **Human-owned memory**: `.dsh-meow/PROJECT.md` per workspace. Plain Markdown, human-editable,
-  git-diffable. Injected in full on the first user message — no truncation.
-- **`memory_remember` tool**: the model can write a memory anytime (categories: fact / mistake /
-  preference / user_said / lesson / detail), appended atomically to the right section.
-- **Automatic reflection**: after a task turn ends (model stopped calling tools), the plugin
-  steers a reflection prompt. The model decides whether anything is worth remembering — and
-  calls `memory_remember` only when there is. Chat-only turns never trigger reflection.
-- **No recursion**: reflection rounds are marked; a turn that already reflected, or whose last
-  tool call was a `memory_` tool, is never asked again.
-- **Zero runtime dependencies**: the host bundle is self-contained (esbuild bundles
-  schemastery / dsh-tools / dsh-llm into `lib/index.js`).
-- **Per-workspace isolation**: different projects, different memory files.
+- **Six memory layers** (`soul` = the AI itself / `user` = user basics & preferences /
+  `project` = per-project info with `subcategory` (overview/structure/decisions/quotes/ops/todo) /
+  `fact` = atomic facts / `lesson` = mistakes & corrections / `topic` = ongoing discussion arcs
+  with a goal sentence). One SQLite table per layer, UUIDs are time-prefixed so id order ==
+  creation order.
+- **Cache-friendly by design**: `soul`/`user` are injected in full on the first user message,
+  plus a memory index (project/topic titles) and keyword-hit short facts/lessons. The system
+  prompt never changes; the snapshot is frozen for the whole session. Already-seen memories
+  (`injected` + `searched`) are recorded per session and never re-injected or re-searched.
+- **Toolset**: `memory_remember` (write, with dedup merge) / `memory_search` (BM25 × recency,
+  filters: level/project/status/days, sorted by memory timestamp) / `memory_find_similar`
+  (duplicate & conflict detection) / `memory_read` / `memory_update` (incl. status
+  active/archived/stale, importance, goal) / `memory_dream` (manual trigger).
+- **Memory timestamp** (`dream_at`): each window's dreams stamp its entries with the last
+  conversation time before the dream — later windows can tell which entry is newer. Search
+  results are re-ordered by it with a "conflict → newest wins" hint.
+- **Per-window dream**: at night (02:00–05:00, idle) every window whose last chat is newer than
+  its last dream gets consolidated by its own main agent — one project group per turn — using
+  its full conversation context. Old windows (no live agent, >24h) are left alone.
+- **Reflection**: after ≥7 consecutive tool turns the plugin asks the model whether anything
+  since the last consolidation is worth remembering. Cancelled turns never trigger it.
+- **Zero runtime dependencies**: `node:sqlite` (built into Node ≥22.5) + self-contained esbuild
+  bundle (`lib/index.js`). No native modules.
 
 ## 📦 Install
-
-### Via `dsh plugin` (requires the package to be published / linked)
-
-```sh
-dsh plugin --profile web add meow-memory
-dsh web
-```
 
 ### Via npm (published package)
 
@@ -58,19 +60,11 @@ npm install meow-memory
 
 1. Copy (or symlink) this package into the profile's `node_modules`:
    ```sh
-   # e.g. for the web profile of a DSH home at ~/.dsh
    mkdir -p ~/.dsh/profiles/web/node_modules
    ln -s /path/to/meow-memory ~/.dsh/profiles/web/node_modules/meow-memory
    ```
    (On Windows: `New-Item -ItemType Junction ...` — NTFS junction, no admin needed.)
-2. Register in the profile's `cordis.patch.yml`:
-   ```yaml
-   - insert:
-       - id: meow-memory
-         name: 'meow-memory'
-         config:
-           enabled: true
-   ```
+2. Register in the profile's `cordis.patch.yml` (same insert block as above).
 3. Restart `dsh web`. New sessions pick up the plugin automatically.
 
 ## ⚙️ Configuration
@@ -81,42 +75,41 @@ All fields are optional (profile patch or `cordis.patch.yml`):
 - id: meow-memory
   name: 'meow-memory'
   config:
-    enabled: true          # master switch (false = no injection, no tool, no reflection)
+    enabled: true          # master switch
     projectDir: '.dsh-meow' # memory directory, relative to the workspace
-    projectFile: 'PROJECT.md' # memory file name
-    reflect: true          # auto-reflection after ReAct task turns
+    hitTopK: 3             # keyword-hit facts/lessons injected on the first message
+    reflect: true          # auto-reflection after ≥reflectTurns tool turns
+    reflectTurns: 7        # consecutive tool turns before reflection triggers
+    dream:
+      enabled: true
+      windowStart: 2       # local hour when night consolidation may run
+      windowEnd: 5
+      idleMinutes: 30      # no session events for this long before dreaming
+      checkMinutes: 15
 ```
 
 ## 🧠 How it works
 
 ```
-First user message            memory_remember tool             task end
+First user message            memory tools                     night
 ┌──────────────────┐          ┌──────────────────┐            ┌──────────────────────┐
-│ [PROJECT.md      │          │ model calls it   │            │ agent/turn-stopping  │
-│  snapshot]       │          │ → append to       │            │ saw tool calls?      │
-│ ─────────────    │          │   .dsh-meow/      │            │ last tool memory_*?  │
-│ [user text]      │          │   PROJECT.md      │            │ already reflected?   │
-└──────────────────┘          └──────────────────┘            │ → agent.steer(reflect│
-   injected once per                atomic write              │   prompt) if yes     │
-   session, never again                                       └──────────────────────┘
+│ [soul 核心]       │          │ remember/search/  │            │ per-window dream:     │
+│ [user 偏好]       │          │ find_similar/     │            │ own memories, grouped │
+│ [记忆导引]        │          │ read/update       │            │ by project, one group │
+│ [相关记忆 命中]    │          └──────────────────┘            │ per turn, dream_at    │
+│ ─────────────    │          seen ids recorded                │ stamped at T          │
+│ [user text]      │          per session (json)               └──────────────────────┘
+└──────────────────┘
+   injected once per
+   session, never again
 ```
-
-Memory content guidance (embedded in the tool description and the reflection prompt):
-
-- important facts, conclusions, decisions;
-- mistakes and **corrections from the user** (always worth keeping);
-- the user's own description of the project (quote them);
-- surprises;
-- lessons from repeated failed attempts;
-- user preferences (communication / working / coding style, project-related);
-- hard-won details that took many tool calls to find.
 
 ## 🛠 Development
 
 ```sh
 npm install
 npm run build          # esbuild bundle → lib/index.js (self-contained)
-npm run test           # 25 logic tests: tool, store, injection, reflection, recursion guard
+npm run test           # 80 logic tests: db / bm25 / migrate / inject / reflect / dream / tools
 ```
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's
