@@ -180,9 +180,11 @@ export function advanceDream(agent: unknown): void {
     return
   }
 
-  // 收尾：全部条目 dream_at = T；窗口 last_dream_time = T；dream_log 留痕
+  // 收尾：全部条目 dream_at = T（封存语义不变）；窗口 last_dream_time = dream 完成时刻
+  // （不是 T！dream 轮本身会产生会话事件推后 last_event_time，若记 T 则
+  // last_dream_time < last_event_time 永远成立 → 窗口永远"需要 dream" 无限重复）。
   const stamped = db.stampDream(task.sessionId, task.T)
-  db.setWindowDream(task.sessionId, task.T)
+  db.setWindowDream(task.sessionId, Date.now())
   db.logDream(
     `window dream done: ${task.sessionId.slice(0, 8)} groups=${task.groups.length} stamped=${stamped} T=${new Date(task.T).toISOString()}`,
     { before: undefined, after: undefined },
@@ -241,7 +243,10 @@ export interface DreamConfig {
   checkMinutes: number
 }
 
-/** 后台定时检查（全局 setInterval + dispose 清理；cordis 无内置定时器）。 */
+/** 后台定时检查（全局 setInterval + dispose 清理；cordis 无内置定时器）。
+ *  判定纯时间化（用户拍板）：窗口最后发言在 24h 内 且 最后动作不是 dream
+ *  （last_dream_time < last_event_time）；不依赖 live agent 存在性。
+ *  执行时尝试取 agent（liveAgents 或 ctx.agents.get），进程重启后取不到 → 跳过（旧窗口精神）。 */
 export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow', windowIndex: Map<string, string>): () => void {
   const timer = setInterval(() => {
     if (!cfg.enabled) return
@@ -254,8 +259,10 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
       const db = getDb(workspace, dir)
       const w = db.getWindow(sessionId)
       if (!w || !windowNeedsDream(w)) continue
-      const agent = liveAgents.get(sessionId)
-      if (!agent) continue // 旧窗口（无 live agent）不碰
+      const agent =
+        liveAgents.get(sessionId) ??
+        (typeof ctx.agents?.get === 'function' ? ctx.agents.get(sessionId) : undefined)
+      if (!agent) continue // 进程内无该窗口 agent（重启后）：跳过
       const started = startWindowDream(ctx, agent as never, workspace, dir)
       if (started) return // 一轮一个窗口
     }
