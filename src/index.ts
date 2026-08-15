@@ -3,8 +3,9 @@
  *
  * 设计要点：
  * 1. 记忆文件：每个工作区一份 `.dsh-meow/PROJECT.md`（纯文本、人可读可编辑）。
- * 2. 注入：新会话的第一条用户消息末尾附带 PROJECT.md 快照（作为普通对话注入，
- *    不动 system prompt，不破坏前缀缓存；会话内快照不变，之后的记忆更新不影响历史）。
+ * 2. 注入：新会话的第一条用户消息开头附带完整的 PROJECT.md 快照（不截断；
+ *    作为普通对话注入，不动 system prompt，不破坏前缀缓存；会话内快照不变，
+ *    之后的记忆更新不影响历史）。
  * 3. 工具：`memory_remember` — 模型可随时主动把值得记住的信息写入 PROJECT.md。
  * 4. 自动反思：turn 结束（模型不再调用工具）时，若本 turn 干过活（调用过工具）、
  *    且最后一个工具不是 memory_ 系列、且本 turn 尚未注入过反思消息，
@@ -33,8 +34,6 @@ export const Config = z.object({
   projectDir: z.string().default('.dsh-meow'),
   /** 记忆文件名。 */
   projectFile: z.string().default('PROJECT.md'),
-  /** 注入时最多携带的字符数（超出截断）。 */
-  maxInjectChars: z.number().step(1).min(256).max(20000).default(4000),
   /** 是否在 ReAct 任务结束后自动注入反思。 */
   reflect: z.boolean().default(true),
 })
@@ -91,7 +90,6 @@ interface ResolvedConfig {
   enabled: boolean
   projectDir: string
   projectFile: string
-  maxInjectChars: number
   reflect: boolean
 }
 
@@ -101,7 +99,6 @@ function resolveConfig(config: unknown): ResolvedConfig {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
     projectFile: c.projectFile ?? 'PROJECT.md',
-    maxInjectChars: c.maxInjectChars ?? 4000,
     reflect: c.reflect ?? true,
   }
 }
@@ -147,13 +144,9 @@ function appendEntry(path: string, category: string, content: string): void {
   renameSync(tmp, path)
 }
 
-/** 构造注入文本：分割线 + 快照说明 + 内容（超长截断）。 */
-function buildInjection(text: string, maxChars: number): string {
-  const clipped =
-    text.length > maxChars
-      ? `${text.slice(0, maxChars)}\n\n(记忆文件过长，已截断；完整内容见 .dsh-meow/PROJECT.md)`
-      : text
-  return `\n\n---\n\n[项目记忆 PROJECT.md — 由 meow-memory 注入，本会话内保持此快照不变]\n\n${clipped}`
+/** 构造注入文本：分割线 + 快照说明 + 完整内容（不截断）+ 结束标记 + 用户输入分隔。 */
+function buildInjection(text: string): string {
+  return `\n\n---\n\n[项目记忆 PROJECT.md — 由 meow-memory 注入，本会话内保持此快照不变]\n\n${text}\n\n=====记忆文件结束=====\n\n\n【本轮用户输入】：\n\n`
 }
 
 /** 扫描最后一个 turn/start 之后的事件，判断本 turn 的工具调用与反思情况。 */
@@ -273,6 +266,9 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     const decision = await next()
     if (decision === undefined || decision.kind !== 'enter' || signal.aborted) return decision
     if (decision.messages.length === 0) return decision
+    // 子代理不注入：它们的 prompt 由父代理提供（如 dsh-femwa 的角色上下文），
+    // 注入 PROJECT.md 会污染子任务。
+    if (agent.session.header.parentSession !== undefined) return decision
     // 只注入一次：会话历史里已存在任何 user/message 就不再注入。
     if (agent.session.events.some((e) => (e as { type?: string }).type === 'user/message')) return decision
     // 只对真实用户消息注入（source.kind === 'user'）。
@@ -282,18 +278,20 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     if (!path) return decision
     const text = readProject(path)
     if (!text) return decision
-    const injected = buildInjection(text, resolved.maxInjectChars)
+    const injected = buildInjection(text)
     const rewritten: UserMessage[] = [
-      { ...first, content: [...first.content, { type: 'text', text: injected }] },
+      // 记忆内容放在用户发言之前：先看到完整记忆，再看到用户本条消息。
+      { ...first, content: [{ type: 'text', text: injected }, ...first.content] },
       ...decision.messages.slice(1),
     ]
-    ctx.logger.info(`meow-memory: injected PROJECT.md (${text.length} chars) into first user message`)
+    ctx.logger.info(`meow-memory: injected PROJECT.md (${text.length} chars) before first user message`)
     return { ...decision, messages: rewritten }
   })
 
   // 3) ReAct 任务结束后的自动反思。
   ctx.on('agent/turn-stopping', ({ agent }) => {
     if (!resolved.reflect) return
+    if (agent.session.header.parentSession !== undefined) return // 子代理不反思
     const { sawToolCall, lastToolName, sawReflect } = scanTurn(agent.session.events)
     if (sawReflect) return // 本 turn 已反思过（含反思轮自身结束）
     if (!sawToolCall) return // 纯聊天轮，不反思

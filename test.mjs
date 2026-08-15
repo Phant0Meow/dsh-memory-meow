@@ -89,6 +89,27 @@ const decisionA = await preStep(
 check('injects into first user message', decisionA.kind === 'enter' && decisionA.messages.length === 1 &&
   decisionA.messages[0].content.some(b => b.type === 'text' && b.text.includes('[项目记忆 PROJECT.md')))
 
+// memory must come FIRST (before the user's own text), not appended after
+const contentA = decisionA.messages[0].content
+check('memory block is the first block', contentA[0].type === 'text' &&
+  contentA[0].text.includes('[项目记忆 PROJECT.md'))
+check('user text comes after the memory block',
+  contentA.length >= 2 && contentA[1].type === 'text' && contentA[1].text === '你好')
+
+// long memory file → full content injected, no truncation
+const wsLong = mkdtempSync(join(tmpdir(), 'mm-long-'))
+const longText = 'L'.repeat(20000) // far beyond the old 4000-char cap
+mkdirSync(join(wsLong, '.dsh-meow'), { recursive: true })
+writeFileSync(join(wsLong, '.dsh-meow', 'PROJECT.md'), longText)
+const agentLong = makeAgent(wsLong)
+const decisionLong = await preStep(
+  { agent: agentLong, messages: [{ content: [{ type: 'text', text: '嗨' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '嗨' }], source: { kind: 'user' } }] }),
+)
+const longBlock = decisionLong.messages[0].content[0].text
+check('injects complete memory without truncation',
+  longBlock.includes(longText) && !longBlock.includes('已截断'))
+
 // second time (session now has user/message history) → no injection
 const agentB = makeAgent(ws, [events.userMsg('之前有一条')])
 const decisionB = await preStep(
@@ -151,6 +172,7 @@ check('disabled registers no handlers', Object.keys(handlersOff).length === 0)
 
 rmSync(ws, { recursive: true, force: true })
 rmSync(wsEmpty, { recursive: true, force: true })
+rmSync(wsLong, { recursive: true, force: true })
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)
