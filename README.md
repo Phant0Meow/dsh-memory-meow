@@ -23,18 +23,25 @@
   在 system prompt 中注册一次——文本恒定，KV 缓存友好。动态快照（`soul`/`user` 全量 +
   记忆索引 + 关键词命中的短 fact/lesson）作为第一条用户消息的前缀注入；system prompt 本身
   不随会话变化，快照在整场会话中冻结。已见记忆（`injected` + `searched`）按会话记录，
-  绝不重复注入或重复检索。
-- **工具集**：`memory_remember`（写入，自动去重合并）/ `memory_search`（BM25 × 近期权重，
-  支持 level/project/status/days 过滤，按记忆时间戳排序）/ `memory_find_similar`（查重与
-  冲突检测）/ `memory_read` / `memory_update`（含 status active/archived/stale、importance、
-  goal）/ `memory_dream`（手动触发）。
+  绝不重复注入或重复检索；收到会话压缩信号（`compaction/*`）时释放已见记录，
+  允许压缩后被再次命中提取。首轮导引还会列出「用户的所有 project」（四表动态并集）
+  供 `memory_project` 选用。
+- **工具集**：`memory_remember`（写入，自动去重合并，返回读回确认：关键词/项目归属）/
+  `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，按记忆时间戳排序）/
+  `memory_project`（项目全景注入段落：按子标签分组、未过时条目全给、todo 输出
+  「已完成：」最近 5 条 +「To do list：」，末尾附记忆库与会话历史定位说明）/
+  `memory_find_similar`（查重与冲突检测）/ `memory_read` / `memory_update`（含 status
+  active/archived/stale、importance、goal）/ `memory_dream`（手动触发）。
 - **记忆时间戳**（`dream_at`）：每个窗口 dream 时以整理前的最后对话时间戳封存其条目——
   后续窗口据此判断哪条更新。搜索结果按它重排，并带"冲突 → 最新为准"提示。
 - **按窗口 dream**：夜间（按 `timeZone` 计算，默认 00:00–07:00，空闲时）每个最后发言
   晚于上次 dream 的窗口由自己的主 agent 整理——每个项目一组、一轮一组——使用其完整
   会话上下文。无 live agent 且超过 24h 的旧窗口、以及已归档的会话，均不处理。
-- **反思**：连续 ≥7 轮工具调用后，插件询问模型自上次整理以来是否有值得记忆的内容。
+- **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
   被取消的轮次绝不触发。
+- **反思轮折叠 UI（client 端）**：记忆反思/dream 轮的 prompt 与后续 think/tool call/汇报
+  折叠成一条横条（默认折叠，显示「新增记忆 N 条」），点击向下展开成卡片查看完整记录；
+  原始消息流保持干净，工作汇报不再被记忆汇报刷屏。
 - **零运行时依赖**：`node:sqlite`（Node ≥22.5 内置）+ 自包含 esbuild 产物（`lib/index.js`）。
   无原生模块。
 

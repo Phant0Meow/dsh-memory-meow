@@ -31,9 +31,9 @@ import {
   scheduleDream,
   type DreamConfig,
 } from './dream.js'
-import { buildInjection } from './inject.js'
+import { buildInjection, markSearched, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
-import { buildReflectMessage, consecutiveToolTurns, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
+import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { registerMemoryTools } from './tools.js'
 
 export const name = 'meow-memory'
@@ -53,14 +53,15 @@ lesson=教训 / topic=话题）。记忆按"记忆时间戳"排序，冲突以�
 工具：
 - memory_remember —— 写记忆。必填 content；level 选层（默认 fact）；project 记项目名
   （femwa/meow-memory/meow-eyes/dsh…，level=project 必填）；fact/lesson 一句话 ≤60 字；
-  topic 需 title（建议配 goal 目标句）；用户介绍设计思路/框架/决策理由的原话必须保留措辞不转述；
+  topic 需 title（建议配 goal 目标句与 project 项目名）；用户介绍设计思路/框架/决策理由的原话必须保留措辞不转述；
   写前可先 memory_find_similar 查重。
 - memory_search —— 检索。只返回其他会话建立的记忆（本会话已注入/已检索的自动排除）；
   默认搜 fact/lesson/topic；支持 level 逗号多选、project/status/days 过滤；k 1-50。
+- memory_project —— 当你需要全面了解某个项目的整体概述、设计历史、技术决策、用户原话或进度时使用。
 - memory_find_similar —— 按 id 找内容相似条目（查重/找冲突用）。
 - memory_read —— 读完整条目（含元数据）。
 - memory_update —— 改条目（content/status 含 archived=完结、stale=过时；todo 的 stale=已完成；
-  importance/goal/project/subcategory）。
+  importance/goal/project/subcategory/keywords（手动修正关键词，默认自动提取））。
 - memory_dream —— 立即整理本窗口记忆（通常夜间自动）。`
 
 // ── 性能诊断（perf.log，固定位置 ~/.dsh-meow/perf.log；卡死时查数据） ────────
@@ -101,7 +102,7 @@ export const Config = z.object({
   titleMax: z.number().min(10).max(200).default(40),
   /** 是否在 ReAct 任务结束后自动注入反思。 */
   reflect: z.boolean().default(true),
-  /** 连续工具轮达到该值才在结束时触发反思（用户拍板：单轮简单调用不触发）。 */
+  /** 单任务内连续工具 step 达到该值才在结束时触发反思（用户拍板：react ≥7 轮）。 */
   reflectTurns: z.number().min(1).max(50).default(7),
   /** 首次打开库时自动迁移旧 PROJECT.md。 */
   autoMigrate: z.boolean().default(true),
@@ -221,6 +222,17 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     perfEvent()
     noteActivity()
     const t = event?.type
+    // 压缩信号：会话历史被压缩（内容已不在上下文）→ 释放本会话已见记录，
+    // 允许之前注入/检索过的记忆被再次命中提取。
+    if (t === 'compaction/summary' || t === 'compaction/start') {
+      const sid = session?.id
+      const cwd = session?.header?.cwd
+      if (typeof sid === 'string' && typeof cwd === 'string') {
+        releaseSeen(cwd, sid, resolved.projectDir)
+        ctx.logger.info(`meow-memory: compaction signal, released seen memory for session ${sid.slice(0, 8)}`)
+      }
+      return
+    }
     if (t !== 'user/message' && t !== 'turn/end' && t !== 'assistant/message' && t !== 'tool/result') return
     const sid = session?.id
     const cwd = session?.header?.cwd
@@ -318,7 +330,7 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     if (sawReflect) return // 本 turn 已反思过（含反思轮自身结束）
     if (!sawToolCall) return // 纯聊天轮，不反思
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
-    if (consecutiveToolTurns(agent.session.events) < resolved.reflectTurns) return // 连续工具轮不足
+    if (consecutiveToolSteps(agent.session.events) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
     agent.steer(message)
     if (Date.now() - t0 > 20) perf(`turn-stopping slow ${Date.now() - t0}ms`)
@@ -346,6 +358,6 @@ export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile } from './inject.js'
-export { buildReflectMessage, consecutiveToolTurns, scanTurn } from './reflect.js'
+export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity, hourInTimeZone } from './dream.js'

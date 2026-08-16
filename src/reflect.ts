@@ -1,8 +1,9 @@
 /**
  * meow-memory v2 — ReAct 任务结束后的自动反思。
  *
- * 触发：连续 react（工具）轮 ≥ reflectTurns（默认 7）后，在该轮结束时触发一次；
- * 单轮简单工具调用不触发。顶层会话、本 turn 未反思过、最后工具非 memory_ 系列。
+ * 触发：一次任务（单个 turn）内连续 react（工具）step ≥ reflectTurns（默认 7）
+ * 后，在该轮结束时触发一次；单次简单工具调用不触发。顶层会话、本 turn 未反思过、
+ * 最后工具非 memory_ 系列。
  * 反思消息三块：
  *   1) 记忆清单（fact/lesson 短条目、原话保留、project/topic 规则）；
  *   2) 话题偏离信号（keyword 聚类余弦，只提醒不拍板）；
@@ -67,48 +68,37 @@ export function scanTurn(events: readonly unknown[]): {
 }
 
 /**
- * 从事件流尾部向前数「连续工具轮」：每个 turn 内含 tool-call（且非 memory_ 系列）
- * 计一轮；遇到非工具轮或记忆标记（meow-memory 消息 / memory_ 工具调用）所在轮即停。
- * 用户拍板：连续 react 7 轮以上才在结束时触发反思，简单一轮工具调用不触发。
+ * 统计当前 turn（最后一个 turn/start 之后）内「连续非 memory_ 工具 step」的最大段长。
+ * 每个 tool-call 计 1 step（同一 assistant/message 内的并行调用逐个计数）；
+ * memory_ 工具调用中断连续段（已主动记忆，不再反思）。用户拍板：一次任务
+ * 连续 react ≥7 个工具 step 才在任务结束时触发反思。
  */
-export function consecutiveToolTurns(events: readonly unknown[]): number {
-  let count = 0
-  let i = events.length - 1
-  while (i >= 0) {
-    let start = -1
-    for (let j = i; j >= 0; j--) {
-      if ((events[j] as { type?: string }).type === 'turn/start') {
-        start = j
-        break
-      }
+export function consecutiveToolSteps(events: readonly unknown[]): number {
+  let startIdx = 0
+  for (let i = events.length - 1; i >= 0; i--) {
+    if ((events[i] as { type?: string }).type === 'turn/start') {
+      startIdx = i
+      break
     }
-    const segStart = start === -1 ? 0 : start
-    let sawTool = false
-    let sawMemoryMark = false
-    for (let j = segStart; j <= i; j++) {
-      const e = events[j] as {
-        type?: string
-        data?: {
-          source?: { kind?: string; plugin?: string }
-          message?: { content?: Array<{ type?: string; name?: string }> }
-        }
-      }
-      if (e?.type === 'user/message' && e.data?.source?.kind === 'plugin' && e.data.source.plugin === 'meow-memory') {
-        sawMemoryMark = true
-      } else if (e?.type === 'assistant/message') {
-        for (const b of e.data?.message?.content ?? []) {
-          if (b.type === 'tool-call' && typeof b.name === 'string') {
-            if (b.name.startsWith('memory_')) sawMemoryMark = true
-            else sawTool = true
-          }
-        }
-      }
-    }
-    if (sawMemoryMark || !sawTool) break
-    count++
-    i = segStart - 1
   }
-  return count
+  let best = 0
+  let cur = 0
+  for (let i = startIdx; i < events.length; i++) {
+    const e = events[i] as {
+      type?: string
+      data?: { message?: { content?: Array<{ type?: string; name?: string }> } }
+    }
+    if (e?.type !== 'assistant/message') continue
+    for (const b of e.data?.message?.content ?? []) {
+      if (b.type !== 'tool-call' || typeof b.name !== 'string') continue
+      if (b.name.startsWith('memory_')) cur = 0
+      else {
+        cur++
+        if (cur > best) best = cur
+      }
+    }
+  }
+  return best
 }
 
 const BASE_PROMPT = [
@@ -129,6 +119,7 @@ const BASE_PROMPT = [
   '【二】总结话题进展',
   '如果你们正在讨论的话题有了新的进展、新的事实、新的发展经过结果，你可以更新话题描述。',
   '话题 topic 规则：',
+  '- topic 创建/更新时必须带 project 参数（所属项目名，见会话开头导引中的项目列表）。',
   '- 一条 topic = 一个正在进行或刚结束的讨论线索，可跨会话持续。',
   '- 创建时用 memory_remember 写目标句（goal）与名词性标题（对象+动作，如「femGen 集成」；禁止宽泛名如"dsh 插件"）。',
   '- 归属判断：本 turn 是否让已有 topic 的目标句更接近一步？是 → memory_update 重写该 topic（【起因经过发展结果】≤300 字，旧的没价值信息可丢弃）；否（与目标无因果关联的独立事项）→ 新建 topic。',

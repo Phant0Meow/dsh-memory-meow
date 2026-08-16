@@ -81,6 +81,14 @@ export function markSearched(workspace: string, sessionId: string, ids: string[]
   writeFileSync(file, JSON.stringify({ injected: seen.injected, searched: [...set] }), 'utf8')
 }
 
+/** 释放本会话已见记录（收到会话压缩信号后调用）：清空 injected/searched，
+ *  允许之前注入/检索过的记忆被再次命中提取——压缩后它们的内容已不在上下文里。 */
+export function releaseSeen(workspace: string, sessionId: string, dir = '.dsh-meow'): void {
+  const file = sessionsFile(workspace, sessionId, dir)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify({ injected: [], searched: [] }), 'utf8')
+}
+
 function toDocs(rows: MemoryRow[]): Doc[] {
   return rows.map((r) => ({
     id: r.id,
@@ -134,6 +142,11 @@ export function buildInjection(
   // 记忆导引：project 按项目分组、topic 标题列表。正文不注入，模型自取。
   if (projects.length > 0 || topics.length > 0) {
     lines.push('【记忆导引】需要时用 memory_search 检索、memory_read 读取（只看标题，正文自取）：')
+    // 用户的所有项目名（动态派生）：查项目全景（概述/决策/进度）用 memory_project。
+    const projectNames = db.listProjectNames()
+    if (projectNames.length > 0) {
+      lines.push(`用户的所有 project：${projectNames.join(' / ')}（查项目全景用 memory_project）`)
+    }
     const byProject = new Map<string, MemoryRow[]>()
     for (const p of projects) {
       const name = p.project ?? '未分类'
@@ -145,7 +158,8 @@ export function buildInjection(
     }
     for (const t of topics) {
       const mark = t.status === 'stale' ? '（stale）' : ''
-      lines.push(`- topic:${shortTitle(t, o.titleMax)}${mark}`)
+      const proj = t.project ? `（project:${t.project}）` : ''
+      lines.push(`- topic:${shortTitle(t, o.titleMax)}${proj}${mark}`)
     }
     lines.push('')
   }

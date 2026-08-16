@@ -1,7 +1,7 @@
 {
   "name": "meow-memory",
-  "version": "0.2.0",
-  "description": "Cross-session project memory for DeepSeek Harness: PROJECT.md snapshot injected into the first user message (cache-friendly), memory_remember tool, and automatic reflection after ReAct tasks.",
+  "version": "0.5.1",
+  "description": "Cross-session project memory for DeepSeek Harness: six-layer SQLite memory, first-message snapshot injection, memory_remember/search/project tools, automatic reflection with reflection-fold UI, and nightly dream consolidation.",
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -14,6 +14,7 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -29,12 +30,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "test": "node test.mjs",
+    "test": "node test.mjs && node tests/client-fold.mjs",
     "link-workspace": "powershell -ExecutionPolicy Bypass -File scripts/link-workspace.ps1"
   },
   "devDependencies": {

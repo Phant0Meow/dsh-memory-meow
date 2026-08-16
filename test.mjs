@@ -131,6 +131,7 @@ check('dream message marker', dtxt.includes('[meow-memory-dream]'))
 check('dream message group title', dtxt.includes('项目「dsh」'))
 check('dream message T label', dtxt.includes('1970-01-01 00:00'))
 check('dream message rules', dtxt.includes('原话') && dtxt.includes('importance') && dtxt.includes('find_similar') && dtxt.includes('本组整理完成'))
+check('dream rules require project param', dtxt.includes('project 参数'))
 dbD.close()
 
 // ── recall 增强：find_similar / seen 排除 ───────────────────────────────────
@@ -204,12 +205,22 @@ check('migrate idempotent', migrateLegacy(db2, ws2) === null)
 // inject + sessions/ 去重
 db2.insert({ level: 'fact', content: '3081 端口是喵版 dsh', project: 'dsh', created_at: Date.now() })
 db2.insert({ level: 'soul', content: '我是用户的长期协作伙伴。', created_at: Date.now() })
+// listProjectNames：四表 project 列并集（只挂 fact 的项目名也出现）
+db2.insert({ level: 'fact', content: '猫眼视觉服务', project: 'meow-eyes', created_at: Date.now() })
+check('project names union includes fact-only project', db2.listProjectNames().includes('meow-eyes'))
+check('project names sorted', JSON.stringify(db2.listProjectNames()) === JSON.stringify(['dsh', 'femwa', 'meow-eyes']))
+// 导引 topic 带 project 归属
+db2.insert({ level: 'topic', content: '【起因】x【经过】y【结果】z', title: '记忆插件重构', project: 'meow-memory', created_at: Date.now() })
 const inj = buildInjection(db2, ws2, 'test-session-1', '3081 现在什么状态？', { hitTopK: 3 }, '.dsh-meow')
 check('injection produced', inj !== null)
 if (inj) {
   check('injection blocks', inj.text.includes('【soul 核心】') && inj.text.includes('【user 偏好】') &&
     inj.text.includes('【记忆导引】') && inj.text.includes('【相关记忆】'))
   check('injection guide lists project', inj.text.includes('project:femwa'))
+  check('injection topic carries project', inj.text.includes('topic:记忆插件重构（project:meow-memory）'))
+  check('injection lists all project names', inj.text.includes('用户的所有 project：'))
+  check('injection project names derived from four tables', inj.text.includes('femwa') && inj.text.includes('dsh'))
+  check('injection project names hint memory_project', inj.text.includes('memory_project'))
   check('injection hit content', inj.text.includes('3081 端口是喵版 dsh'))
   check('injection format', inj.text.includes('=====记忆结束=====') && inj.text.includes('【本轮用户输入】：'))
   check('injection tool name fixed', !inj.text.includes('memory_recall') && inj.text.includes('memory_search'))
@@ -227,6 +238,7 @@ db3.insert({ level: 'topic', content: '【起因】重构记忆插件【经过�
 const msg = buildReflectMessage(ws3, '我们讨论一下猫眼插件的模型部署', '.dsh-meow')
 const txt = msg.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
 check('reflect message', txt.includes('[记忆反思]') && txt.includes('目标句') && txt.includes('宽泛名') && txt.includes('subcategory'))
+check('reflect requires project param', txt.includes('project 参数') && txt.includes('项目列表'))
 check('reflect draft attached', txt.includes('相关话题底稿') && txt.includes('meow-memory 重构'))
 
 // 空库 → 注入 null
@@ -250,8 +262,77 @@ function makeCtx() {
 
 const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow' })
-check('six tools registered', tools.length === 6 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream']
+check('seven tools registered', tools.length === 7 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
+
+// 返回结果引导语：search 的 note 与 read 的渲染文本都提示可去聊天记录搜更多细节
+const searchTool = tools.find((t) => t.name === 'memory_search')
+const execCtx = { agent: { session: { header: { cwd: ws, id: 't-search' } } } }
+const searchResult = await searchTool.execute({ query: '随便' }, execCtx)
+check('search note hints chat log', searchResult.note.includes('如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词'))
+const readTool = tools.find((t) => t.name === 'memory_read')
+const readNotFound = readTool.output.render({}, { found: false })
+check('read not-found hints chat log', readNotFound[0].text.includes('聊天记录里搜索相关关键词'))
+const readFound = readTool.output.render({}, { found: true, level: 'fact', title: 't', content: 'c', status: 'active' })
+check('read found hints chat log', readFound[0].text.includes('聊天记录里搜索相关关键词'))
+
+// memory_update 支持 keywords 手动修正（AI 主动提取/纠偏）
+const updateTool = tools.find((t) => t.name === 'memory_update')
+const updCtx = { agent: { session: { header: { cwd: ws, id: 't-upd' } } } }
+const kwId = db.insert({ level: 'fact', content: '测试关键词修正', project: 'dsh' }).id
+const upRes = await updateTool.execute({ id: kwId.slice(0, 8), keywords: ['关键词甲', '关键词乙'] }, updCtx)
+check('update keywords ok', upRes.ok === true)
+const kwRow = db.findById(kwId)
+check('update keywords applied', JSON.stringify(kwRow.row.keywords) === JSON.stringify(['关键词甲', '关键词乙']))
+const upEmpty = await updateTool.execute({ id: kwId.slice(0, 8), keywords: [] }, updCtx)
+check('update keywords clear', upEmpty.ok === true && JSON.stringify(db.findById(kwId).row.keywords) === '[]')
+
+// memory_remember 读回确认：返回实际存储结果（关键词/项目归属），模型知道干了什么
+const rememberTool = tools.find((t) => t.name === 'memory_remember')
+const remRes = await rememberTool.execute({ content: '读回确认测试关键词', level: 'fact', project: 'dsh' }, updCtx)
+check('remember returns keywords', Array.isArray(remRes.keywords) && remRes.keywords.length > 0, JSON.stringify(remRes))
+check('remember returns project', remRes.project === 'dsh')
+check('remember render shows result', rememberTool.output.render({}, remRes)[0].text.includes('关键词：'))
+
+// 压缩信号释放 seen：compaction 事件 → sessions 文件清空 → 记忆可再次命中
+const wsSeen = mkdtempSync(join(tmpdir(), 'mm-seen-'))
+const dbSeen = new MemoryDb(memoryDbPath(wsSeen))
+dbSeen.insert({ level: 'fact', content: '压缩后应能重新命中的记忆', project: 'dsh', source_session: 'win-other' })
+markSearched(wsSeen, 's-comp', ['fake-id-1'], '.dsh-meow')
+check('seen marked before compaction', readSeen(wsSeen, 's-comp', '.dsh-meow').size === 1)
+await handlers['session/event']({ id: 's-comp', header: { cwd: wsSeen } }, { type: 'compaction/summary', time: Date.now() })
+check('seen released after compaction', readSeen(wsSeen, 's-comp', '.dsh-meow').size === 0)
+const searchCtx2 = { agent: { session: { header: { cwd: wsSeen, id: 's-comp' } } } }
+const reHit = await searchTool.execute({ query: '重新命中', project: 'dsh' }, searchCtx2)
+check('search re-hits after compaction', reHit.hits.some((h) => h.content.includes('压缩后应能重新命中')))
+dbSeen.close()
+
+// memory_project：项目完整注入段落（用户拍板规格：全量/分组/排序/已完成 5 条）
+const projectTool = tools.find((t) => t.name === 'memory_project')
+const projCtx = { agent: { session: { header: { cwd: ws, id: 't-proj' } } } }
+const t0 = Date.now()
+db.insert({ level: 'project', content: 'overview 旧条目', project: 'femwa', subcategory: 'overview', dream_at: t0 })
+db.insert({ level: 'project', content: 'overview 新条目', project: 'femwa', subcategory: 'overview', dream_at: t0 + 1000 })
+db.insert({ level: 'project', content: '决策条目', project: 'femwa', subcategory: 'decisions' })
+db.insert({ level: 'project', content: 'todo 进行中 A', project: 'femwa', subcategory: 'todo' })
+db.insert({ level: 'project', content: 'todo 进行中 B', project: 'femwa', subcategory: 'todo' })
+db.insert({ level: 'project', content: 'todo 无时间戳已完成', project: 'femwa', subcategory: 'todo', status: 'stale' })
+for (let i = 1; i <= 7; i++) {
+  db.insert({ level: 'project', content: `已完成事项 ${i}`, project: 'femwa', subcategory: 'todo', status: 'stale', dream_at: t0 + i * 1000 })
+}
+db.insert({ level: 'project', content: '已归档条目', project: 'femwa', subcategory: 'overview', status: 'archived' })
+const pj = await projectTool.execute({ project: 'femwa' }, projCtx)
+check('project 段落含项目名', pj.text.startsWith('【项目：femwa】'))
+check('project 分组标题齐全', pj.text.includes('项目概述') && pj.text.includes('技术决策') && pj.text.includes('项目进度'))
+check('project overview 旧→新排序', pj.text.indexOf('overview 旧条目') < pj.text.indexOf('overview 新条目'))
+check('project archived 排除', !pj.text.includes('已归档条目'))
+check('todo 已完成只取 dream_at 最近 5 条', pj.text.includes('已完成事项 3') && !pj.text.includes('已完成事项 1') && !pj.text.includes('已完成事项 2'))
+check('todo 已完成按旧→新展示', pj.text.indexOf('已完成事项 3') < pj.text.indexOf('已完成事项 7'))
+check('todo 无时间戳已完成排除', !pj.text.includes('无时间戳已完成'))
+check('todo To do list 全量', pj.text.includes('todo 进行中 A') && pj.text.includes('todo 进行中 B'))
+check('todo 已完成在 To do 之前', pj.text.indexOf('已完成：') < pj.text.indexOf('To do list：'))
+const pjEmpty = await projectTool.execute({ project: 'nope' }, projCtx)
+check('project 空项目提示', pjEmpty.text.includes('暂无记忆条目'))
 
 // system prompt 手册：宿主有 systemPrompt 服务 → 注册 order 130 的静态 section；无 → 静默跳过
 const guideCtx = makeCtx()
@@ -260,7 +341,7 @@ guideCtx.ctx.get = (name) => (name === 'systemPrompt' ? { section: (s) => sectio
 await apply(guideCtx.ctx, { enabled: true, projectDir: '.dsh-meow' })
 check('guide section registered', sections.length === 1 && sections[0].name === 'meow-memory:guide' &&
   sections[0].order === 130 && sections[0].text === MEMORY_GUIDE, `got ${JSON.stringify(sections)}`)
-check('guide covers all six tools', ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream']
+check('guide covers all seven tools', ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project']
   .every((n) => MEMORY_GUIDE.includes(n)))
 check('guide has no {{variable}} refs', !MEMORY_GUIDE.includes('{{'))
 
@@ -307,50 +388,49 @@ const decisionC = await preStep(
 )
 check('no injection for subagent', decisionC.messages[0].content.length === 1)
 
-// turn-stopping 反思（连续工具轮 ≥7 才触发）
+// turn-stopping 反思（单任务内连续工具 step ≥7 才触发——用户拍板语义）
 const stopping = handlers['agent/turn-stopping']
 check('turn-stopping registered', typeof stopping === 'function')
 
-// 构造 7 个连续工具轮
-const sevenToolTurns = []
-for (let t = 1; t <= 7; t++) {
-  sevenToolTurns.push(events.turnStart(), events.userMsg(`干活${t}`), events.assistantWithTool('bash'), events.assistantText(`完成${t}`))
-}
+// 单 turn 内 7 个连续工具 step → 触发
+const sevenSteps = [events.turnStart(), events.userMsg('干活'), ...Array.from({ length: 7 }, () => events.assistantWithTool('bash'))]
 const steered = []
-const agentD = { session: { header: { cwd: ws, id: 's4' }, events: sevenToolTurns }, steer: (m) => steered.push(m) }
-stopping({ agent: agentD, turn: 7, signal: new AbortController().signal })
-check('steer after 7 consecutive tool turns', steered.length === 1 && steered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
+const agentD = { session: { header: { cwd: ws, id: 's4' }, events: sevenSteps }, steer: (m) => steered.push(m) }
+stopping({ agent: agentD, turn: 1, signal: new AbortController().signal })
+check('steer after 7 consecutive tool steps', steered.length === 1 && steered[0].content.some((b) => b.type === 'text' && b.text.includes('记忆反思')))
 
-// 单轮工具调用 → 不触发
+// 单步工具调用 → 不触发
 const steered1 = []
 const agentD1 = { session: { header: { cwd: ws, id: 's4b' }, events: [events.turnStart(), events.userMsg('干活'), events.assistantWithTool('bash'), events.assistantText('完成')] }, steer: (m) => steered1.push(m) }
 stopping({ agent: agentD1, turn: 1, signal: new AbortController().signal })
-check('no steer on single tool turn', steered1.length === 0)
+check('no steer on single tool step', steered1.length === 0)
 
-// 6 轮 → 不触发；7 轮含 memory_ 标记 → 重新计数
-const sixToolTurns = []
-for (let t = 1; t <= 6; t++) {
-  sixToolTurns.push(events.turnStart(), events.userMsg(`干活${t}`), events.assistantWithTool('bash'), events.assistantText(`完成${t}`))
-}
+// 6 步 → 不触发
+const sixSteps = [events.turnStart(), events.userMsg('干活'), ...Array.from({ length: 6 }, () => events.assistantWithTool('bash'))]
 const steered6 = []
-const agentD6 = { session: { header: { cwd: ws, id: 's4c' }, events: sixToolTurns }, steer: (m) => steered6.push(m) }
-stopping({ agent: agentD6, turn: 6, signal: new AbortController().signal })
-check('no steer on 6 tool turns', steered6.length === 0)
+const agentD6 = { session: { header: { cwd: ws, id: 's4c' }, events: sixSteps }, steer: (m) => steered6.push(m) }
+stopping({ agent: agentD6, turn: 1, signal: new AbortController().signal })
+check('no steer on 6 tool steps', steered6.length === 0)
 
-// consecutiveToolTurns 单元测试
-const { consecutiveToolTurns } = await import('./lib/index.js')
-check('consecutiveToolTurns counts 7', consecutiveToolTurns(sevenToolTurns) === 7)
-check('consecutiveToolTurns counts 1', consecutiveToolTurns([events.turnStart(), events.userMsg('x'), events.assistantWithTool('bash')]) === 1)
-check('consecutiveToolTurns stops at chat turn', consecutiveToolTurns([
-  ...sixToolTurns,
-  events.turnStart(), events.userMsg('闲聊'), events.assistantText('嗯'),
-  events.turnStart(), events.userMsg('再干'), events.assistantWithTool('bash'),
-]) === 1)
-check('consecutiveToolTurns resets at memory_ tool', consecutiveToolTurns([
-  ...sixToolTurns,
-  events.turnStart(), events.userMsg('记住'), events.assistantWithTool('memory_remember'),
-  events.turnStart(), events.userMsg('再干'), events.assistantWithTool('bash'),
-]) === 1)
+// 跨 turn 不算：前面 turn 的工具不累计进当前 turn
+const acrossTurns = [events.turnStart(), events.userMsg('干活1'), events.assistantWithTool('bash'), events.turnStart(), events.userMsg('干活2'), events.assistantWithTool('bash')]
+check('consecutiveToolSteps only current turn', (await import('./lib/index.js')).consecutiveToolSteps(acrossTurns) === 1)
+
+// consecutiveToolSteps 单元测试
+const { consecutiveToolSteps } = await import('./lib/index.js')
+check('consecutiveToolSteps counts 7', consecutiveToolSteps(sevenSteps) === 7)
+check('consecutiveToolSteps counts 1', consecutiveToolSteps([events.turnStart(), events.userMsg('x'), events.assistantWithTool('bash')]) === 1)
+check('consecutiveToolSteps chat turn = 0', consecutiveToolSteps([events.turnStart(), events.userMsg('闲聊'), events.assistantText('嗯')]) === 0)
+check('consecutiveToolSteps resets at memory_ tool', consecutiveToolSteps([
+  events.turnStart(), events.userMsg('干活'),
+  events.assistantWithTool('bash'), events.assistantWithTool('bash'),
+  events.assistantWithTool('memory_remember'),
+  events.assistantWithTool('bash'), events.assistantWithTool('bash'),
+]) === 2)
+check('consecutiveToolSteps counts parallel calls', consecutiveToolSteps([
+  events.turnStart(), events.userMsg('干活'),
+  { type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', id: 'p1', name: 'bash', arguments: '{}' }, { type: 'tool-call', id: 'p2', name: 'grep', arguments: '{}' }] } } },
+]) === 2)
 
 const steered2 = []
 const agentE = { session: { header: { cwd: ws, id: 's5' }, events: [events.turnStart(), events.userMsg('你好'), events.assistantText('你好呀')] }, steer: (m) => steered2.push(m) }

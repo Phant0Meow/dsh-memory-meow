@@ -307,6 +307,17 @@ export class MemoryDb {
     return row.n
   }
 
+  /** 全部出现过（含已过时）的项目名：project/fact/lesson/topic 四表的 project 列并集。
+   *  供记忆导引列出"用户的所有 project"（动态派生，无需手工维护）。 */
+  listProjectNames(): string[] {
+    const names = new Set<string>()
+    for (const level of ['project', 'fact', 'lesson', 'topic'] as const) {
+      const rows = this.db.prepare(`SELECT project FROM ${level} WHERE project IS NOT NULL AND project != ''`).all() as Array<{ project: string }>
+      for (const r of rows) names.add(r.project)
+    }
+    return [...names].sort((a, b) => a.localeCompare(b))
+  }
+
   logDream(summary: string, changes: unknown, note = ''): void {
     this.db
       .prepare('INSERT INTO dream_log (run_at, summary, changes, note) VALUES (?, ?, ?, ?)')

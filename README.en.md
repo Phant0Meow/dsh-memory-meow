@@ -29,9 +29,14 @@ conversation timestamp.
   and keyword-hit short facts/lessons) is injected as a prefix of the first user message;
   the system prompt itself never changes per session and the snapshot is frozen for the
   whole session. Already-seen memories (`injected` + `searched`) are recorded per session
-  and never re-injected or re-searched.
-- **Toolset**: `memory_remember` (write, with dedup merge) / `memory_search` (BM25 × recency,
-  filters: level/project/status/days, sorted by memory timestamp) / `memory_find_similar`
+  and never re-injected or re-searched; a session-compaction signal (`compaction/*`) releases
+  the seen records so compressed-away memories can be hit again. The first-turn guide also
+  lists "all your projects" (dynamic union across four tables) for `memory_project`.
+- **Toolset**: `memory_remember` (write, dedup merge, returns read-back confirmation:
+  keywords/project) / `memory_search` (BM25 × recency, filters: level/project/status/days,
+  sorted by memory timestamp) / `memory_project` (whole-project injection paragraph:
+  grouped by subcategory, all non-stale entries, todo section with latest 5 done +
+  to-do list, plus memory-db & session-history pointers) / `memory_find_similar`
   (duplicate & conflict detection) / `memory_read` / `memory_update` (incl. status
   active/archived/stale, importance, goal) / `memory_dream` (manual trigger).
 - **Memory timestamp** (`dream_at`): each window's dreams stamp its entries with the last
@@ -42,8 +47,12 @@ conversation timestamp.
   consolidated by its own main agent — one project group per turn — using its full
   conversation context. Old windows (no live agent, >24h) and archived sessions are left
   alone.
-- **Reflection**: after ≥7 consecutive tool turns the plugin asks the model whether anything
-  since the last consolidation is worth remembering. Cancelled turns never trigger it.
+- **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the
+  model whether anything since the last consolidation is worth remembering. Cancelled
+  turns never trigger it.
+- **Reflection-fold UI (client)**: reflection/dream turns (prompt, think, tool calls and
+  the report) collapse into a slim bar (collapsed by default, showing "N memories added");
+  clicking expands it into a card with the full record — the message flow stays clean.
 - **Zero runtime dependencies**: `node:sqlite` (built into Node ≥22.5) + self-contained esbuild
   bundle (`lib/index.js`). No native modules.
 

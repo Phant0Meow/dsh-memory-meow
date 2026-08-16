@@ -88,8 +88,9 @@ const DREAM_RULES = [
   '4. 互相矛盾的条目 → 按事实修改（保留最新事实，旧版本标 archived）；',
   '5. 核查 importance：重要决策/红线/教训 → 2 或 3；琐碎 → 1；',
   '6. 更新事件最新进展与 todo：topic 重写【经过/结果】段；project 的 todo 子类完成 → 标 stale（视为 done）；',
-  '7. 改动前若怀疑重复，先 memory_find_similar 查重；',
-  '8. 完成后直接回复"本组整理完成"，不要调用其他工具。',
+  '7. topic 创建/更新必须带 project 参数（所属项目名）；',
+  '8. 改动前若怀疑重复，先 memory_find_similar 查重；',
+  '9. 完成后直接回复"本组整理完成"，不要调用其他工具。',
 ].join('\n')
 
 /** 构造一组 dream 指令消息。 */

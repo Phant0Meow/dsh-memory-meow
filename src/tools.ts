@@ -10,7 +10,7 @@
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { findSimilar, search, tokenize } from './bm25.js'
-import { getDb, getDreamWorkspace, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
+import { getDb, getDreamWorkspace, memoryDbPath, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { readSeen, markSearched } from './inject.js'
 
 export type { Level }
@@ -130,13 +130,19 @@ function rememberTool(dir: string): ToolDefinition {
           id: { type: 'string' },
           level: { type: 'string' },
           merged: { type: 'boolean' },
+          keywords: { type: 'array', items: { type: 'string' }, description: '实际存储的关键词（自动提取；合并后为最新值）。' },
+          project: { type: 'string', description: '实际归属项目（若有）。' },
+          title: { type: 'string', description: '实际标题（若有）。' },
         },
       },
       render: (_args, value) => {
-        const v = value as { level?: unknown; merged?: unknown; id?: unknown }
+        const v = value as { level?: unknown; merged?: unknown; id?: unknown; keywords?: unknown; project?: unknown }
+        const kw = Array.isArray(v.keywords) && v.keywords.length > 0 ? `关键词：${v.keywords.join(' / ')}。` : ''
+        const proj = typeof v.project === 'string' ? `项目：${v.project}。` : ''
+        const head = v.merged ? '✅ 已合并到已有条目' : '✅ 记忆已写入'
         return [{
           type: 'text' as const,
-          text: `✅ 记忆已写入（${String(v.level ?? 'fact')}${v.merged ? '，已合并到已有条目' : ''}${typeof v.id === 'string' ? `，id=${v.id.slice(0, 8)}` : ''}）。无需重复调用本工具。`,
+          text: `${head}（${String(v.level ?? 'fact')}${typeof v.id === 'string' ? `，id=${v.id.slice(0, 8)}` : ''}）。${proj}${kw}无需重复调用本工具。`,
         }]
       },
     },
@@ -184,7 +190,17 @@ function rememberTool(dir: string): ToolDefinition {
         if (goal && level === 'topic') patch.goal = goal
         if (level === 'lesson' && corrected) patch.corrected = 1
         db.update(level, merged.id, patch)
-        return { ok: true, id: merged.id, level, merged: true }
+        // 读回合并后的实际存储结果（关键词等），让模型知道最终落库形态。
+        const after = db.findById(merged.id)?.row
+        return {
+          ok: true,
+          id: merged.id,
+          level,
+          merged: true,
+          keywords: after?.keywords ?? merged.keywords,
+          ...(after?.project ? { project: after.project } : {}),
+          ...(after?.title ? { title: after.title } : {}),
+        }
       }
 
       const row = db.insert({
@@ -199,7 +215,15 @@ function rememberTool(dir: string): ToolDefinition {
         keywords: extractKeywords(content),
         source_session,
       })
-      return { ok: true, id: row.id, level, merged: false }
+      return {
+        ok: true,
+        id: row.id,
+        level,
+        merged: false,
+        keywords: row.keywords,
+        ...(row.project ? { project: row.project } : {}),
+        ...(row.title ? { title: row.title } : {}),
+      }
     },
     presentCall(args: unknown): { card: 'generic'; title: string; kind: 'write' } {
       const parsed = args as { content?: unknown }
@@ -225,7 +249,7 @@ function searchTool(dir: string): ToolDefinition {
       properties: {
         query: { type: 'string', description: '检索关键词/句子。' },
         level: { type: 'string', description: '限定层级，逗号多选：fact/lesson/topic/project/soul/user（默认 fact,lesson,topic）。' },
-        project: { type: 'string', description: '按项目名过滤（如 femwa）。' },
+        project: { type: 'string', description: '按项目名过滤（见记忆导引中的项目列表）。' },
         status: { type: 'string', enum: ['active', 'archived', 'stale', 'all'], description: '按状态过滤（默认 active；todo 类的 stale 视为已完成参与）。' },
         days: { type: 'integer', minimum: 1, maximum: 3650, description: '只看最近 N 天创建的条目（按创建时间）。' },
         k: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: '返回条数上限。' },
@@ -306,7 +330,7 @@ function searchTool(dir: string): ToolDefinition {
       // 按记忆时间戳（dream_at）重排：旧→新；null 视为最旧（从未封存）。
       const reordered = [...hits].sort((a, b) => (a.dream_at ?? 0) - (b.dream_at ?? 0))
       return {
-        note: '如果冲突，以最新的为准。时间戳较旧的条目可作为事情发展过程的参考。',
+        note: '如果冲突，以最新的为准。时间戳较旧的条目可作为事情发展过程的参考。如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词。',
         hits: reordered.map((h) => ({
           id: h.id,
           level: h.level,
@@ -451,11 +475,13 @@ function readTool(dir: string): ToolDefinition {
       },
       render: (_args, value) => {
         const v = value as { found?: boolean; level?: unknown; title?: unknown; content?: unknown; status?: unknown; project?: unknown; goal?: unknown }
-        if (!v.found) return [{ type: 'text' as const, text: '未找到该记忆。' }]
+        const hint = '如果你确实需要更多细节，可以直接去聊天记录里搜索相关关键词。'
+        if (!v.found) return [{ type: 'text' as const, text: `未找到该记忆。${hint}` }]
         const parts = [`[${String(v.level ?? '')}] ${String(v.title ?? '')}（${String(v.status ?? '')}）`]
         if (v.project) parts.push(`项目：${String(v.project)}`)
         if (v.goal) parts.push(`目标：${String(v.goal)}`)
         parts.push(String(v.content ?? ''))
+        parts.push(hint)
         return [{ type: 'text' as const, text: parts.join('\n') }]
       },
     },
@@ -510,6 +536,7 @@ function updateTool(dir: string): ToolDefinition {
         importance: { type: 'integer', minimum: 0, maximum: 3 },
         goal: { type: 'string', description: '新目标句（topic）。' },
         project: { type: 'string', description: '新项目名（project/fact/lesson）。' },
+        keywords: { type: 'array', items: { type: 'string' }, description: '手动指定关键词（默认写入时自动提取；发现不准时主动修正/补充，空数组=清空）。' },
       },
     },
     output: {
@@ -529,7 +556,7 @@ function updateTool(dir: string): ToolDefinition {
       },
     },
     async execute(args: unknown, exec: ToolRunContext) {
-      const parsed = args as { id?: unknown; content?: unknown; title?: unknown; status?: unknown; importance?: unknown; goal?: unknown; project?: unknown }
+      const parsed = args as { id?: unknown; content?: unknown; title?: unknown; status?: unknown; importance?: unknown; goal?: unknown; project?: unknown; keywords?: unknown }
       const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
       if (!id) throw new Error('memory_update: id 不能为空')
       const workspace = workspaceOf(exec)
@@ -546,6 +573,9 @@ function updateTool(dir: string): ToolDefinition {
       if (typeof parsed.project === 'string' && parsed.project.trim() && (found.level === 'project' || found.level === 'fact' || found.level === 'lesson')) {
         patch.project = parsed.project.trim()
       }
+      if (Array.isArray(parsed.keywords)) {
+        patch.keywords = parsed.keywords.filter((k): k is string => typeof k === 'string').map((k) => k.trim()).filter((k) => k.length > 0)
+      }
       const ok = db.update(found.level, found.row.id, patch)
       return { ok, id: found.row.id, level: found.level }
     },
@@ -556,10 +586,132 @@ function updateTool(dir: string): ToolDefinition {
   }
 }
 
+/** 子标签 → 注入段落标题。 */
+const PROJECT_SECTION_TITLES: Record<ProjectSubcategory, string> = {
+  overview: '项目概述',
+  structure: '项目结构',
+  decisions: '技术决策',
+  quotes: '用户原话',
+  ops: '部署与数据',
+  todo: '项目进度',
+}
+
+/** 组内排序：记忆时间戳（dream_at）旧→新，相同按创建时间；null 视为最旧。 */
+function sortByDreamAt(list: MemoryRow[]): MemoryRow[] {
+  return [...list].sort((a, b) => (a.dream_at ?? 0) - (b.dream_at ?? 0) || a.created_at - b.created_at)
+}
+
+/**
+ * memory_project：取回某项目的完整注入段落（用户拍板规格）。
+ * - 非 todo 子标签：active 条目全部；
+ * - todo 子标签：active 全部为「To do list：」+ stale（已完成）按 dream_at 取最近 5 条为「已完成：」；
+ * - 组内按记忆时间戳旧→新；只拼 content 纯文本，不写复杂格式。
+ */
+function projectTool(dir: string): ToolDefinition {
+  return {
+    name: 'memory_project',
+    description: [
+      '取回某个项目在记忆库中的完整注入段落（纯文本，按子标签分组，未过时条目一口气全给）。',
+      '当用户问起某个项目（femwa/meow-memory/meow-eyes/dsh…）的设计历史、技术决策、用户原话、项目进度时调用；',
+      '也用于需要项目全景上下文再作答的场合。',
+      '规则：组内按记忆时间戳旧→新；todo 子标签输出「已完成：」（最近完成 5 条）+「To do list：」。',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['project'],
+      properties: {
+        project: { type: 'string', description: '项目名（会话开头的记忆导引会列出用户的所有 project，直接选用）。' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['project', 'text'],
+        properties: {
+          project: { type: 'string' },
+          text: { type: 'string', description: '按子标签分组的项目记忆注入段落（纯文本）。' },
+        },
+      },
+      render: (_args, value) => {
+        const v = value as { text?: unknown }
+        return [{ type: 'text' as const, text: String(v.text ?? '') }]
+      },
+    },
+    async execute(args: unknown, exec: ToolRunContext) {
+      const parsed = args as { project?: unknown }
+      const project = typeof parsed.project === 'string' ? parsed.project.trim() : ''
+      if (!project) throw new Error('memory_project: project 不能为空')
+      const workspace = workspaceOf(exec)
+      if (!workspace) throw new Error('memory_project: 无法确定工作区（会话无 cwd）')
+      const db = getDb(workspace, dir)
+      const rows = db.list('project', { project }).filter((r) => r.project === project)
+      const active = rows.filter((r) => r.status === 'active')
+      // todo 已完成：stale 且 dream_at 非空，按 dream_at 取最近 5 条（展示仍按旧→新）。
+      const done = sortByDreamAt(
+        rows
+          .filter((r) => r.subcategory === 'todo' && r.status === 'stale' && r.dream_at !== null)
+          .sort((a, b) => (b.dream_at ?? 0) - (a.dream_at ?? 0))
+          .slice(0, 5),
+      )
+      const bySub = new Map<ProjectSubcategory, MemoryRow[]>()
+      for (const r of active) {
+        const sub = r.subcategory ?? 'overview' // 早期无子类条目归概述组
+        const list = bySub.get(sub) ?? []
+        list.push(r)
+        bySub.set(sub, list)
+      }
+      const sections: string[] = []
+      for (const sub of PROJECT_SUBCATEGORIES) {
+        if (sub === 'todo') {
+          const todos = sortByDreamAt(bySub.get('todo') ?? [])
+          if (todos.length === 0 && done.length === 0) continue
+          const lines = [PROJECT_SECTION_TITLES.todo]
+          if (done.length > 0) {
+            lines.push('已完成：')
+            for (const r of done) lines.push(r.content)
+          }
+          if (todos.length > 0) {
+            lines.push('To do list：')
+            for (const r of todos) lines.push(r.content)
+          }
+          sections.push(lines.join('\n'))
+        } else {
+          const list = sortByDreamAt(bySub.get(sub) ?? [])
+          if (list.length === 0) continue
+          sections.push(`${PROJECT_SECTION_TITLES[sub]}\n${list.map((r) => r.content).join('\n')}`)
+        }
+      }
+      if (sections.length === 0) {
+        return { project, text: `【项目：${project}】该项目暂无记忆条目。` }
+      }
+      const dbPath = memoryDbPath(workspace, dir)
+      const text = [
+        `【项目：${project}】`,
+        '',
+        sections.join('\n\n'),
+        '',
+        '——',
+        '说明：此处只提供未过时的信息。',
+        `如果你想看已过时的条目（archived/stale），或某条记忆的具体时间戳（记忆时间戳=该窗口 dream 封存时刻）、记忆来源（source_session）、重要性、关键词等元数据，可以直接去搜记忆库 SQLite：${dbPath}`,
+        '（库内结构：六层表 soul/user/project/fact/lesson/topic，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at/dream_at；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
+        `如果你想了解未被记录的更多细节，可以直接去搜会话历史目录（dsh 的 session 日志，位置由 DSH_HOME 决定，默认 ~/.dsh/sessions，喵版为 dsh-home/sessions），按会话 id 查原始记录。`,
+      ].join('\n')
+      return { project, text }
+    },
+    presentCall(args: unknown): { card: 'generic'; title: string; kind: 'read' } {
+      const parsed = args as { project?: unknown }
+      return { card: 'generic', title: `memory_project: ${String(parsed.project ?? '').slice(0, 24)}`, kind: 'read' }
+    },
+  }
+}
+
 export function registerMemoryTools(register: (t: ToolDefinition) => void, dir = '.dsh-meow'): void {
   register(rememberTool(dir))
   register(searchTool(dir))
   register(findSimilarTool(dir))
   register(readTool(dir))
   register(updateTool(dir))
+  register(projectTool(dir))
 }
