@@ -236,26 +236,51 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow'): ToolDefinition {
 
 export interface DreamConfig {
   enabled: boolean
-  windowStart: number // 本地小时
+  windowStart: number // 目标时区小时
   windowEnd: number
   idleMinutes: number
   minIntervalHours: number
   checkMinutes: number
+  /** 夜间窗口按此时区计算（默认 Asia/Shanghai——用户系统是美区时间，系统时区会算错）。 */
+  timeZone: string
+}
+
+/** 取指定时区的当前小时（Intl 支持；无效时区回退系统时区）。 */
+export function hourInTimeZone(timeZone: string, date = new Date()): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', hour12: false }).formatToParts(date)
+    const h = parts.find((p) => p.type === 'hour')?.value
+    if (h !== undefined) return parseInt(h, 10) % 24
+  } catch {
+    /* 无效时区 */
+  }
+  return date.getHours()
 }
 
 /** 后台定时检查（全局 setInterval + dispose 清理；cordis 无内置定时器）。
  *  判定纯时间化（用户拍板）：窗口最后发言在 24h 内 且 最后动作不是 dream
  *  （last_dream_time < last_event_time）；不依赖 live agent 存在性。
+ *  已归档的会话（workspaceRegistry.archivedSessionIds）视为不存在，不 dream（用户拍板）。
  *  执行时尝试取 agent（liveAgents 或 ctx.agents.get），进程重启后取不到 → 跳过（旧窗口精神）。 */
 export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow', windowIndex: Map<string, string>): () => void {
   const timer = setInterval(() => {
     if (!cfg.enabled) return
     if (currentDream !== null) return // 串行
-    const now = new Date()
-    const hour = now.getHours()
+    const hour = hourInTimeZone(cfg.timeZone)
     if (hour < cfg.windowStart || hour >= cfg.windowEnd) return
     if (Date.now() - lastActivity() < cfg.idleMinutes * 60_000) return
+    // 已归档会话集合（registry 全局归档；服务不可用时跳过检查）
+    const archived = new Set<string>()
+    try {
+      const reg = (ctx as { get?: (name: string) => unknown }).get?.('workspaceRegistry') as
+        | { archivedSessionIds?: readonly string[] }
+        | undefined
+      for (const id of reg?.archivedSessionIds ?? []) archived.add(id)
+    } catch {
+      /* workspaceRegistry 不可用：不做归档过滤 */
+    }
     for (const [sessionId, workspace] of windowIndex) {
+      if (archived.has(sessionId)) continue // 已归档 = 当不存在
       const db = getDb(workspace, dir)
       const w = db.getWindow(sessionId)
       if (!w || !windowNeedsDream(w)) continue

@@ -82,10 +82,12 @@ All fields are optional (profile patch or `cordis.patch.yml`):
     reflectTurns: 7        # consecutive tool turns before reflection triggers
     dream:
       enabled: true
-      windowStart: 2       # local hour when night consolidation may run
-      windowEnd: 5
+      windowStart: 0       # night window hours, computed in timeZone (below)
+      windowEnd: 7
       idleMinutes: 30      # no session events for this long before dreaming
       checkMinutes: 15
+      timeZone: 'Asia/Shanghai'  # the user's machine clock is US time; the night
+                                 # window must follow this fixed zone instead
 ```
 
 ## 🧠 How it works

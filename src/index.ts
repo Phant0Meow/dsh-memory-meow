@@ -87,11 +87,13 @@ export const Config = z.object({
   dream: z
     .object({
       enabled: z.boolean().default(true),
-      windowStart: z.number().min(0).max(23).default(2),
-      windowEnd: z.number().min(0).max(24).default(5),
+      windowStart: z.number().min(0).max(23).default(0),
+      windowEnd: z.number().min(0).max(24).default(7),
       idleMinutes: z.number().min(1).default(30),
       minIntervalHours: z.number().min(1).default(24),
       checkMinutes: z.number().min(1).default(15),
+      // 用户系统是美区时间（隐私设置），夜间窗口按中国时区计算
+      timeZone: z.string().default('Asia/Shanghai'),
     })
     .default({}),
 })
@@ -120,11 +122,12 @@ function resolveConfig(config: unknown): ResolvedConfig {
     autoMigrate: c.autoMigrate ?? true,
     dream: {
       enabled: d.enabled ?? true,
-      windowStart: d.windowStart ?? 2,
-      windowEnd: d.windowEnd ?? 5,
+      windowStart: d.windowStart ?? 0,
+      windowEnd: d.windowEnd ?? 7,
       idleMinutes: d.idleMinutes ?? 30,
       minIntervalHours: d.minIntervalHours ?? 24,
       checkMinutes: d.checkMinutes ?? 15,
+      timeZone: d.timeZone ?? 'Asia/Shanghai',
     },
   }
 }
@@ -315,4 +318,4 @@ export { migrateLegacy } from './migrate.js'
 export { buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile } from './inject.js'
 export { buildReflectMessage, consecutiveToolTurns, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
-export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity } from './dream.js'
+export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity, hourInTimeZone } from './dream.js'

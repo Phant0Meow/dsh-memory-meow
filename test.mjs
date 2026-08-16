@@ -22,6 +22,7 @@ import {
   findSimilar,
   markSearched,
   readSeen,
+  hourInTimeZone,
 } from './lib/index.js'
 
 let passed = 0
@@ -151,6 +152,11 @@ const seenSet = readSeen(wsR, 'win-a', '.dsh-meow')
 check('readSeen after markSearched', seenSet.has('seen-id-1'))
 check('readSeen empty for other session', readSeen(wsR, 'win-b', '.dsh-meow').size === 0)
 dbR.close()
+
+// ── dream 时区（用户系统是美区时间，夜间窗口必须按 Asia/Shanghai 算） ───────
+const midnightUtc = new Date('2026-08-15T00:00:00.000Z')
+check('hourInTimeZone Shanghai at UTC midnight = 8', hourInTimeZone('Asia/Shanghai', midnightUtc) === 8)
+check('hourInTimeZone UTC at UTC midnight = 0', hourInTimeZone('UTC', midnightUtc) === 0)
 
 // migrate
 const ws2 = mkdtempSync(join(tmpdir(), 'mm-mig-'))
