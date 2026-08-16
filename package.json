@@ -1,6 +1,6 @@
 {
   "name": "meow-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-session project memory for DeepSeek Harness: PROJECT.md snapshot injected into the first user message (cache-friendly), memory_remember tool, and automatic reflection after ReAct tasks.",
   "keywords": [
     "deepseek-harness",

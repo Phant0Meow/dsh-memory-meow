@@ -4,11 +4,13 @@ Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deeps
 Born from the "meow" fork — hence the name — but works on any DSH profile.
 
 **The idea**: every workspace keeps a structured memory database (`.dsh-meow/memory.db`,
-SQLite via `node:sqlite`). New sessions get the essential layers injected as a **prefix of the
-first user message** (not the system prompt), so the prompt prefix — and your LLM provider's
-KV/context cache — stays untouched. The model deep-dives into the rest on demand with
-`memory_search` / `memory_find_similar`. Each window's own agent consolidates its memories at
-night ("dream"), and only its own memories — with the window's knowledge frozen at the last
+SQLite via `node:sqlite`). The static tool manual (six layers + every `memory_*` tool's
+usage) lives in the **system prompt** as a fixed section — constant text, so your LLM
+provider's KV/context cache stays untouched. The dynamic layers (soul/user in full, a
+memory index, keyword-hit facts/lessons) are injected as a **prefix of the first user
+message**. The model deep-dives into the rest on demand with `memory_search` /
+`memory_find_similar`. Each window's own agent consolidates its memories at night
+("dream"), and only its own memories — with the window's knowledge frozen at the last
 conversation timestamp.
 
 ## ✨ Features
@@ -18,10 +20,13 @@ conversation timestamp.
   `fact` = atomic facts / `lesson` = mistakes & corrections / `topic` = ongoing discussion arcs
   with a goal sentence). One SQLite table per layer, UUIDs are time-prefixed so id order ==
   creation order.
-- **Cache-friendly by design**: `soul`/`user` are injected in full on the first user message,
-  plus a memory index (project/topic titles) and keyword-hit short facts/lessons. The system
-  prompt never changes; the snapshot is frozen for the whole session. Already-seen memories
-  (`injected` + `searched`) are recorded per session and never re-injected or re-searched.
+- **Cache-friendly by design**: the static `meow-memory:guide` section (order 100) is
+  registered in the system prompt once — constant text, KV-cache friendly. The dynamic
+  snapshot (`soul`/`user` in full, plus a memory index and keyword-hit short
+  facts/lessons) is injected as a prefix of the first user message; the system prompt
+  itself never changes per session and the snapshot is frozen for the whole session.
+  Already-seen memories (`injected` + `searched`) are recorded per session and never
+  re-injected or re-searched.
 - **Toolset**: `memory_remember` (write, with dedup merge) / `memory_search` (BM25 × recency,
   filters: level/project/status/days, sorted by memory timestamp) / `memory_find_similar`
   (duplicate & conflict detection) / `memory_read` / `memory_update` (incl. status

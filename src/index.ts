@@ -38,8 +38,30 @@ import { registerMemoryTools } from './tools.js'
 
 export const name = 'meow-memory'
 
-/** tools 是硬依赖（注册 memory_*）；systemPrompt 刻意不动。 */
+/** tools 是硬依赖（注册 memory_*）；systemPrompt 为可选服务（ctx.get 兜底）。 */
 export const inject = ['tools']
+
+/**
+ * 记忆系统静态手册 —— 挂进 system prompt（order 130 = 工具指南区间末尾，
+ * 紧随各 tool:* 说明（100–116）之后，与工具说明列在一起）。
+ * 文本恒定、不随会话变化 → 前缀稳定，KV 缓存友好；动态记忆内容（soul/user/
+ * 导引/命中）仍走首条消息注入。文案与 tools.ts 的工具 schema 保持一致。
+ */
+export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆（SQLite 六层：soul=AI自身 / user=用户偏好 /
+project=项目（含子类 overview/structure/decisions/quotes/ops/todo）/ fact=原子事实 /
+lesson=教训 / topic=话题）。记忆按"记忆时间戳"排序，冲突以最新为准，旧的可作过程参考。
+工具：
+- memory_remember —— 写记忆。必填 content；level 选层（默认 fact）；project 记项目名
+  （femwa/meow-memory/meow-eyes/dsh…，level=project 必填）；fact/lesson 一句话 ≤60 字；
+  topic 需 title（建议配 goal 目标句）；用户介绍设计思路/框架/决策理由的原话必须保留措辞不转述；
+  写前可先 memory_find_similar 查重。
+- memory_search —— 检索。只返回其他会话建立的记忆（本会话已注入/已检索的自动排除）；
+  默认搜 fact/lesson/topic；支持 level 逗号多选、project/status/days 过滤；k 1-50。
+- memory_find_similar —— 按 id 找内容相似条目（查重/找冲突用）。
+- memory_read —— 读完整条目（含元数据）。
+- memory_update —— 改条目（content/status 含 archived=完结、stale=过时；todo 的 stale=已完成；
+  importance/goal/project/subcategory）。
+- memory_dream —— 立即整理本窗口记忆（通常夜间自动）。`
 
 // ── 性能诊断（perf.log，固定位置 ~/.dsh-meow/perf.log；卡死时查数据） ────────
 // 模块级计数器：模块只初始化一次；apply 每次执行 +1——若日志里 apply 编号异常
@@ -183,6 +205,14 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
   registerMemoryTools((t) => ctx.tools.register(t), resolved.projectDir)
   ctx.tools.register(dreamTool(ctx, resolved.projectDir))
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
+
+  // 记忆系统手册挂进 system prompt（静态文本 → KV 缓存友好；order 130 = 工具指南区间末尾，
+  // 与各 tool:* 说明（100–116）列在一起，不独占开头）。
+  // systemPrompt 是可选服务（别的 profile 可能没加载 dsh-system-prompt），取不到就跳过。
+  const sp = (ctx as { get?: (name: string) => unknown }).get?.('systemPrompt') as
+    | { section?: (section: { name: string; order: number; text: string }) => unknown }
+    | undefined
+  sp?.section?.({ name: 'meow-memory:guide', order: 130, text: MEMORY_GUIDE })
 
   // 窗口表：只处理低频事件类型（流式 assistant/chunk 每块一个事件，绝不逐块写库）。
   // 节流：同一窗口 5 秒内最多落库一次（内存记 lastWrite，事件循环零阻塞）。

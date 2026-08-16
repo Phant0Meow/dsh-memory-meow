@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   apply,
+  MEMORY_GUIDE,
   MemoryDb,
   memoryDbPath,
   closeAllDbs,
@@ -211,6 +212,7 @@ if (inj) {
   check('injection guide lists project', inj.text.includes('project:femwa'))
   check('injection hit content', inj.text.includes('3081 端口是喵版 dsh'))
   check('injection format', inj.text.includes('=====记忆结束=====') && inj.text.includes('【本轮用户输入】：'))
+  check('injection tool name fixed', !inj.text.includes('memory_recall') && inj.text.includes('memory_search'))
   check('sessions file written', readFileSync(join(ws2, '.dsh-meow', 'sessions', 'test-session-1.json'), 'utf8').includes(inj.injectedIds[0]))
 }
 const inj2 = buildInjection(db2, ws2, 'test-session-1', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
@@ -250,6 +252,17 @@ const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow' })
 check('six tools registered', tools.length === 6 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
+
+// system prompt 手册：宿主有 systemPrompt 服务 → 注册 order 130 的静态 section；无 → 静默跳过
+const guideCtx = makeCtx()
+const sections = []
+guideCtx.ctx.get = (name) => (name === 'systemPrompt' ? { section: (s) => sections.push(s) } : undefined)
+await apply(guideCtx.ctx, { enabled: true, projectDir: '.dsh-meow' })
+check('guide section registered', sections.length === 1 && sections[0].name === 'meow-memory:guide' &&
+  sections[0].order === 130 && sections[0].text === MEMORY_GUIDE, `got ${JSON.stringify(sections)}`)
+check('guide covers all six tools', ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream']
+  .every((n) => MEMORY_GUIDE.includes(n)))
+check('guide has no {{variable}} refs', !MEMORY_GUIDE.includes('{{'))
 
 const events = {
   userMsg: (text, source = { kind: 'user' }) => ({ type: 'user/message', data: { content: [{ type: 'text', text }], source } }),

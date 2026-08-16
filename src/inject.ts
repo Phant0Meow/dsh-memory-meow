@@ -3,7 +3,7 @@
  *
  * 结构（用户拍板）：soul/user 全量 + 记忆导引（project/topic 标题列表，
  * 正文模型自取）+ 第一条用户消息关键词命中 fact/lesson 短条目自动注入。
- * 无每轮注入——模型自己用 memory_recall 深挖。
+ * 无每轮注入——模型自己用 memory_search 深挖。
  *
  * 去重：.dsh-meow/sessions/<sessionId>.json 记录本会话注入过的 memory id，
  * 已注入不重复。
@@ -133,7 +133,7 @@ export function buildInjection(
 
   // 记忆导引：project 按项目分组、topic 标题列表。正文不注入，模型自取。
   if (projects.length > 0 || topics.length > 0) {
-    lines.push('【记忆导引】需要时用 memory_recall 搜索、memory_read 读取（只看标题，正文自取）：')
+    lines.push('【记忆导引】需要时用 memory_search 检索、memory_read 读取（只看标题，正文自取）：')
     const byProject = new Map<string, MemoryRow[]>()
     for (const p of projects) {
       const name = p.project ?? '未分类'
@@ -168,7 +168,7 @@ export function buildInjection(
 
   if (lines.length === 0) return null
   const body = lines.join('\n').trimEnd()
-  const text = `\n\n---\n\n[记忆注入 meow-memory — 本会话内快照不变，需要更多用 memory_recall]\n\n${body}\n\n=====记忆结束=====\n\n\n【本轮用户输入】：\n\n`
+  const text = `\n\n---\n\n[记忆注入 meow-memory — 本会话内快照不变，需要更多用 memory_search]\n\n${body}\n\n=====记忆结束=====\n\n\n【本轮用户输入】：\n\n`
   if (injected.length > 0) markInjected(workspace, sessionId, injected, dir)
   return { text, injectedIds: injected }
 }
