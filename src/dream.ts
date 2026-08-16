@@ -28,6 +28,11 @@ const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
 /** dream 消息识别标记（turn-stopping 推进判定用）。 */
 export const DREAM_MARKER = '[meow-memory-dream]'
 
+/** 会话短 id：剥掉 "session-" 前缀再取前 8 位（日志/落库展示用，可辨识窗口）。 */
+export function shortSessionId(sid: string): string {
+  return (sid.startsWith('session-') ? sid.slice(8) : sid).slice(0, 8)
+}
+
 /** 同步文件日志：进程崩溃也不丢（崩溃点定位用）。 */
 function dreamLog(ws: string, dir: string, msg: string): void {
   try {
@@ -163,7 +168,7 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   currentDream = { sessionId, workspace, dir, T, groups, idx: 0 }
   const msg = buildDreamMessage(db, sessionId, T, groups, 0)
   ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-  dreamLog(workspace, dir, `dream start session=${sessionId.slice(0, 8)} groups=${groups.length} T=${T}`)
+  dreamLog(workspace, dir, `dream start session=${shortSessionId(sessionId)} groups=${groups.length} T=${T}`)
   return true
 }
 
@@ -189,10 +194,10 @@ export function advanceDream(agent: unknown): void {
   const stamped = db.stampDream(task.sessionId, task.T)
   db.setWindowDream(task.sessionId, Date.now())
   db.logDream(
-    `window dream done: ${task.sessionId.slice(0, 8)} groups=${task.groups.length} stamped=${stamped} T=${new Date(task.T).toISOString()}`,
+    `window dream done: ${shortSessionId(task.sessionId)} groups=${task.groups.length} stamped=${stamped} T=${new Date(task.T).toISOString()}`,
     { before: undefined, after: undefined },
   )
-  dreamLog(task.workspace, task.dir, `dream done session=${task.sessionId.slice(0, 8)} groups=${task.groups.length} stamped=${stamped}`)
+  dreamLog(task.workspace, task.dir, `dream done session=${shortSessionId(task.sessionId)} groups=${task.groups.length} stamped=${stamped}`)
   currentDream = null
 }
 

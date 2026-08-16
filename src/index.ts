@@ -29,6 +29,7 @@ import {
   noteActivity,
   registerLiveAgent,
   scheduleDream,
+  shortSessionId,
   type DreamConfig,
 } from './dream.js'
 import { buildHitInjection, buildInjection, markSearched, readInjected, releaseSeen } from './inject.js'
@@ -230,7 +231,7 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
       const cwd = session?.header?.cwd
       if (typeof sid === 'string' && typeof cwd === 'string') {
         releaseSeen(cwd, sid, resolved.projectDir)
-        ctx.logger.info(`meow-memory: compaction signal, released seen memory for session ${sid.slice(0, 8)}`)
+        ctx.logger.info(`meow-memory: compaction signal, released seen memory for session ${shortSessionId(sid)}`)
       }
       return
     }
@@ -329,7 +330,7 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
           return { ...decision, messages: rewritten }
         }
       }
-      if (Date.now() - t0 > 10) perf(`pre-step hit ${Date.now() - t0}ms sid=${sid.slice(0, 8)}`) // 热路径超 10ms 有鬼
+      if (Date.now() - t0 > 10) perf(`pre-step hit ${Date.now() - t0}ms sid=${shortSessionId(sid)}`) // 热路径超 10ms 有鬼
     }
     return decision
   })
