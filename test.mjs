@@ -15,6 +15,7 @@ import {
   closeAllDbs,
   migrateLegacy,
   buildInjection,
+  buildHitInjection,
   buildReflectMessage,
   newId,
   groupWindowMemories,
@@ -23,6 +24,8 @@ import {
   findSimilar,
   markSearched,
   readSeen,
+  getCurrentProject,
+  setCurrentProject,
   hourInTimeZone,
 } from './lib/index.js'
 
@@ -47,7 +50,7 @@ db.insert({ level: 'fact', content: 'Node v22 自带 node:sqlite 可用', projec
 db.insert({ level: 'lesson', content: '每轮注入没意义，模型能看见上下文', corrected: 1 })
 db.insert({ level: 'topic', content: '【起因】重构记忆插件【经过】设计讨论【结果】未定', title: 'meow-memory 重构', goal: '让记忆插件 v2 上线' })
 check('six levels insert', db.count('soul') === 1 && db.count('user') === 1 && db.count('project') === 1 &&
-  db.count('fact') === 1 && db.count('lesson') === 1 && db.count('topic') === 1)
+  db.count('fact') === 1 && db.count('lesson') === 1 && db.count('topic') === 1 && db.count('rules') === 0)
 const found = db.findById(s1.id)
 check('findById cross-table', found?.level === 'soul' && found.row.content.includes('长期协作'))
 check('lesson corrected flag', db.list('lesson')[0].corrected === 1)
@@ -69,9 +72,10 @@ const late = newId(Date.now())
 check('newId order = creation order', early < late)
 const p1 = db.insert({ level: 'project', content: '项目目标概述', project: 'femwa', subcategory: 'overview' })
 check('subcategory stored', db.findById(p1.id)?.row.subcategory === 'overview')
-check('dream_at default null', db.findById(p1.id)?.row.dream_at === null)
-db.update('project', p1.id, { dream_at: 12345 })
-check('dream_at update', db.findById(p1.id)?.row.dream_at === 12345)
+check('updated_at default now', db.findById(p1.id)?.row.updated_at !== null)
+const beforeUp = db.findById(p1.id)?.row.updated_at ?? 0
+db.update('project', p1.id, { importance: 2 })
+check('update refreshes updated_at', (db.findById(p1.id)?.row.updated_at ?? 0) >= beforeUp)
 const todo = db.insert({ level: 'project', content: '待办事项', project: 'femwa', subcategory: 'todo' })
 db.update('project', todo.id, { status: 'stale' })
 check('todo stale NOT in active list', db.list('project', { status: 'active' }).some((r) => r.id === todo.id) === false)
@@ -80,16 +84,19 @@ const factStale = db.insert({ level: 'fact', content: '过时事实', project: '
 db.update('fact', factStale.id, { status: 'stale' })
 check('non-todo stale NOT searchable', db.listSearchable('fact').some((r) => r.id === factStale.id) === false)
 
-// 旧 UUID 升级重排
+// 旧 UUID 升级重排 + dream_at 列迁移（并入 updated_at 后删除）
 const wsUp = mkdtempSync(join(tmpdir(), 'mm-up-'))
 const dbUp = new MemoryDb(memoryDbPath(wsUp))
 const legacyId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-dbUp.db.prepare(`INSERT INTO fact (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at, dream_at, project) VALUES (?, NULL, '旧条目', 1, '[]', 'active', NULL, 0, 1000, 1000, NULL, NULL, 'dsh')`).run(legacyId)
+dbUp.db.exec('ALTER TABLE fact ADD COLUMN dream_at INTEGER')
+dbUp.db.prepare(`INSERT INTO fact (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at, dream_at, project) VALUES (?, NULL, '旧条目', 1, '[]', 'active', NULL, 0, 1000, 1000, NULL, 5000, 'dsh')`).run(legacyId)
 dbUp.close()
 const dbUp2 = new MemoryDb(memoryDbPath(wsUp)) // 重新打开触发 upgrade
-const upgraded = dbUp2.db.prepare('SELECT id, dream_at FROM fact').get()
+const upgraded = dbUp2.db.prepare('SELECT id, updated_at FROM fact').get()
 check('legacy id re-ordered', upgraded.id !== legacyId && /^[0-9a-z]{9}-/.test(upgraded.id))
-check('dream_at column added', 'dream_at' in upgraded)
+check('dream_at merged into updated_at', upgraded.updated_at === 5000)
+const dreamCols = dbUp2.db.prepare('PRAGMA table_info(fact)').all().map((c) => c.name)
+check('dream_at column dropped', !dreamCols.includes('dream_at'))
 const tcols = dbUp2.db.prepare('PRAGMA table_info(topic)').all().map((c) => c.name)
 check('topic.project column added', tcols.includes('project'))
 check('topic insert with project', dbUp2.insert({ level: 'topic', content: '话题', title: 't', project: 'femwa' }).project === 'femwa')
@@ -202,7 +209,8 @@ check('detail → project dsh', db2.list('project').some((p) => p.project === 'd
 check('plain fact → fact', db2.list('fact').length === 2 && db2.list('fact').some((f) => f.content.includes('3081')))
 check('migrate idempotent', migrateLegacy(db2, ws2) === null)
 
-// inject + sessions/ 去重
+// inject + sessions/ 去重（命中检索按新语义：未锚定只搜全局；这里先锚定 dsh 模拟干活中的会话）
+setCurrentProject(ws2, 'test-session-1', 'dsh', '.dsh-meow')
 db2.insert({ level: 'fact', content: '3081 端口是喵版 dsh', project: 'dsh', created_at: Date.now() })
 db2.insert({ level: 'soul', content: '我是用户的长期协作伙伴。', created_at: Date.now() })
 // listProjectNames：四表 project 列并集（只挂 fact 的项目名也出现）
@@ -214,23 +222,23 @@ db2.insert({ level: 'topic', content: '【起因】x【经过】y【结果】z',
 const inj = buildInjection(db2, ws2, 'test-session-1', '3081 现在什么状态？', { hitTopK: 3 }, '.dsh-meow')
 check('injection produced', inj !== null)
 if (inj) {
-  check('injection blocks', inj.text.includes('【soul 核心】') && inj.text.includes('【user 偏好】') &&
-    inj.text.includes('【记忆导引】') && inj.text.includes('【相关记忆】'))
-  check('injection guide lists project', inj.text.includes('project:femwa'))
-  check('injection topic carries project', inj.text.includes('topic:记忆插件重构（project:meow-memory）'))
-  check('injection lists all project names', inj.text.includes('用户的所有 project：'))
-  check('injection project names derived from four tables', inj.text.includes('femwa') && inj.text.includes('dsh'))
-  check('injection project names hint memory_project', inj.text.includes('memory_project'))
-  check('injection hit content', inj.text.includes('3081 端口是喵版 dsh'))
-  check('injection format', inj.text.includes('=====记忆结束=====') && inj.text.includes('【本轮用户输入】：'))
+  check('injection blocks', inj.text.includes('===== 长期记忆 =====') && inj.text.includes('【关于user】') &&
+    inj.text.includes('【记忆导引】'))
+  check('injection first line flush-left', inj.text.startsWith('===== 长期记忆 ====='))
+  check('injection guide three lines', inj.text.includes('需要时用 memory_search 检索、memory_read 读取。') &&
+    inj.text.includes('当有项目相关任务时，应先用 memory_project 查项目全景，这样可以对项目有整体理解。') &&
+    inj.text.includes('用户的所有 project：'))
+  check('injection no topic/project title list', !inj.text.includes('- topic:') && !inj.text.includes('- project:'))
+  check('injection format', inj.text.includes('===== 长期记忆结束 =====') && inj.text.includes('本轮用户prompt：'))
   check('injection tool name fixed', !inj.text.includes('memory_recall') && inj.text.includes('memory_search'))
   check('sessions file written', readFileSync(join(ws2, '.dsh-meow', 'sessions', 'test-session-1.json'), 'utf8').includes(inj.injectedIds[0]))
 }
 const inj2 = buildInjection(db2, ws2, 'test-session-1', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
 check('dedup same session', inj2 === null || !inj2.text.includes('3081 端口是喵版 dsh'))
-const inj3 = buildInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
+// 首轮不命中（只注入长期记忆）；命中链路从第二轮起（buildHitInjection）
+setCurrentProject(ws2, 'test-session-2', 'dsh', '.dsh-meow')
+const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
 check('new session gets hits', inj3 !== null && inj3.text.includes('3081 端口是喵版 dsh'))
-
 // reflect 消息（独立库：topic 保持 active）
 const ws3 = mkdtempSync(join(tmpdir(), 'mm-reflect-'))
 const db3 = new MemoryDb(memoryDbPath(ws3))
@@ -238,6 +246,7 @@ db3.insert({ level: 'topic', content: '【起因】重构记忆插件【经过�
 const msg = buildReflectMessage(ws3, '我们讨论一下猫眼插件的模型部署', '.dsh-meow')
 const txt = msg.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
 check('reflect message', txt.includes('[记忆反思]') && txt.includes('目标句') && txt.includes('宽泛名') && txt.includes('subcategory'))
+check('reflect checks outdated memories', txt.includes('信息已经过时') && txt.includes('你应该更新它'))
 check('reflect requires project param', txt.includes('project 参数') && txt.includes('项目列表'))
 check('reflect draft attached', txt.includes('相关话题底稿') && txt.includes('meow-memory 重构'))
 
@@ -286,6 +295,12 @@ const kwRow = db.findById(kwId)
 check('update keywords applied', JSON.stringify(kwRow.row.keywords) === JSON.stringify(['关键词甲', '关键词乙']))
 const upEmpty = await updateTool.execute({ id: kwId.slice(0, 8), keywords: [] }, updCtx)
 check('update keywords clear', upEmpty.ok === true && JSON.stringify(db.findById(kwId).row.keywords) === '[]')
+// memory_update 刷新记忆时间戳（updated_at = 最后更新时间）
+const beforeTs = db.findById(kwId).row.updated_at
+await new Promise((r) => setTimeout(r, 5))
+const upTs = await updateTool.execute({ id: kwId.slice(0, 8), content: '测试关键词修正（时间戳刷新）' }, updCtx)
+const afterTs = db.findById(kwId).row.updated_at
+check('update refreshes memory timestamp', upTs.ok === true && afterTs !== null && (beforeTs === null || afterTs > beforeTs) && afterTs > Date.now() - 60_000)
 
 // memory_remember 读回确认：返回实际存储结果（关键词/项目归属），模型知道干了什么
 const rememberTool = tools.find((t) => t.name === 'memory_remember')
@@ -311,14 +326,14 @@ dbSeen.close()
 const projectTool = tools.find((t) => t.name === 'memory_project')
 const projCtx = { agent: { session: { header: { cwd: ws, id: 't-proj' } } } }
 const t0 = Date.now()
-db.insert({ level: 'project', content: 'overview 旧条目', project: 'femwa', subcategory: 'overview', dream_at: t0 })
-db.insert({ level: 'project', content: 'overview 新条目', project: 'femwa', subcategory: 'overview', dream_at: t0 + 1000 })
+db.insert({ level: 'project', content: 'overview 旧条目', project: 'femwa', subcategory: 'overview', updated_at: t0 })
+db.insert({ level: 'project', content: 'overview 新条目', project: 'femwa', subcategory: 'overview', updated_at: t0 + 1000 })
 db.insert({ level: 'project', content: '决策条目', project: 'femwa', subcategory: 'decisions' })
 db.insert({ level: 'project', content: 'todo 进行中 A', project: 'femwa', subcategory: 'todo' })
 db.insert({ level: 'project', content: 'todo 进行中 B', project: 'femwa', subcategory: 'todo' })
 db.insert({ level: 'project', content: 'todo 无时间戳已完成', project: 'femwa', subcategory: 'todo', status: 'stale' })
 for (let i = 1; i <= 7; i++) {
-  db.insert({ level: 'project', content: `已完成事项 ${i}`, project: 'femwa', subcategory: 'todo', status: 'stale', dream_at: t0 + i * 1000 })
+  db.insert({ level: 'project', content: `已完成事项 ${i}`, project: 'femwa', subcategory: 'todo', status: 'stale', updated_at: t0 + i * 1000 })
 }
 db.insert({ level: 'project', content: '已归档条目', project: 'femwa', subcategory: 'overview', status: 'archived' })
 const pj = await projectTool.execute({ project: 'femwa' }, projCtx)
@@ -326,13 +341,86 @@ check('project 段落含项目名', pj.text.startsWith('【项目：femwa】'))
 check('project 分组标题齐全', pj.text.includes('项目概述') && pj.text.includes('技术决策') && pj.text.includes('项目进度'))
 check('project overview 旧→新排序', pj.text.indexOf('overview 旧条目') < pj.text.indexOf('overview 新条目'))
 check('project archived 排除', !pj.text.includes('已归档条目'))
-check('todo 已完成只取 dream_at 最近 5 条', pj.text.includes('已完成事项 3') && !pj.text.includes('已完成事项 1') && !pj.text.includes('已完成事项 2'))
+check('todo 已完成只取 updated_at 最近 5 条', pj.text.includes('已完成事项 3') && !pj.text.includes('已完成事项 1') && !pj.text.includes('已完成事项 2'))
 check('todo 已完成按旧→新展示', pj.text.indexOf('已完成事项 3') < pj.text.indexOf('已完成事项 7'))
 check('todo 无时间戳已完成排除', !pj.text.includes('无时间戳已完成'))
 check('todo To do list 全量', pj.text.includes('todo 进行中 A') && pj.text.includes('todo 进行中 B'))
 check('todo 已完成在 To do 之前', pj.text.indexOf('已完成：') < pj.text.indexOf('To do list：'))
 const pjEmpty = await projectTool.execute({ project: 'nope' }, projCtx)
 check('project 空项目提示', pjEmpty.text.includes('暂无记忆条目'))
+
+// rules 层：全局高 importance 注入首轮、其余检索/项目段落
+db.insert({ level: 'rules', content: '全局铁律：绝不删除文件只标 archived', project: null, importance: 2 })
+db.insert({ level: 'rules', content: '全局琐碎规则走检索', project: null, importance: 1 })
+db.insert({ level: 'rules', content: '项目特定规则不全局注入', project: 'femwa', importance: 2 })
+db2.insert({ level: 'rules', content: '规则注入测试专用', project: null, importance: 2, created_at: Date.now() })
+db2.insert({ level: 'topic', content: '【起因】规则注入测试话题【经过】x【结果】y', title: '规则注入测试话题', project: 'meow-memory', created_at: Date.now() })
+const injR = buildInjection(db2, ws2, 'test-session-3', '规则注入测试', { hitTopK: 3 }, '.dsh-meow')
+check('rules global high-importance injected', injR !== null && injR.text.includes('【设计原则】') && injR.text.includes('规则注入测试专用'))
+check('rules low-importance not injected', injR !== null && !injR.text.includes('全局琐碎规则走检索'))
+check('rules project-specific not injected globally', injR !== null && !injR.text.includes('项目特定规则不全局注入'))
+// 命中链路（第二轮起）覆盖 rules/topic：低 importance rules 等关键词命中
+setCurrentProject(ws2, 's-hit', 'meow-memory', '.dsh-meow')
+const hitR = buildHitInjection(db2, ws2, 's-hit', '规则注入测试', { hitTopK: 3 }, '.dsh-meow')
+check('keyword hit covers rules', hitR !== null && hitR.text.includes('规则注入测试专用'))
+check('keyword hit covers topic', hitR !== null && hitR.text.includes('规则注入测试话题'))
+
+// 当前 project 锚定：工具调用带 project → 状态更新；命中检索限定"全局+当前项目"
+const anchorCtx = { agent: { session: { header: { cwd: ws2, id: 's-anchor' } } } }
+check('no anchor before tools', getCurrentProject(ws2, 's-anchor', '.dsh-meow') === null)
+const remAnc = await rememberTool.execute({ content: '锚定测试记忆', level: 'fact', project: 'femwa' }, anchorCtx)
+check('remember anchors project', remAnc.ok === true && getCurrentProject(ws2, 's-anchor', '.dsh-meow') === 'femwa')
+await searchTool.execute({ query: '锚定', project: 'meow-memory' }, anchorCtx)
+check('search re-anchors project', getCurrentProject(ws2, 's-anchor', '.dsh-meow') === 'meow-memory')
+await projectTool.execute({ project: 'dsh' }, anchorCtx)
+check('memory_project anchors project', getCurrentProject(ws2, 's-anchor', '.dsh-meow') === 'dsh')
+// 锚定后命中：全局 + 当前项目；未锚定只全局（命中链路）
+await projectTool.execute({ project: 'femwa' }, anchorCtx)
+db2.insert({ level: 'fact', content: 'femwa 专有命中词', project: 'femwa', created_at: Date.now() })
+const hitAnc = buildHitInjection(db2, ws2, 's-anchor', 'femwa 专有命中词', { hitTopK: 3 }, '.dsh-meow')
+check('anchored hit includes current project', hitAnc !== null && hitAnc.text.includes('femwa 专有命中词'))
+const hitNoAnc = buildHitInjection(db2, ws2, 's-no-anchor', 'femwa 专有命中词', { hitTopK: 3 }, '.dsh-meow')
+check('unanchored hit excludes project-only', hitNoAnc === null || !hitNoAnc.text.includes('femwa 专有命中词'))
+
+// 命中基于 keywords 而非全文：content 含词但 keywords 不含 → 不命中（防噪音）
+const noiseId = db2.insert({ level: 'fact', content: '这段话的全文里出现了测试两个字但关键词是别的', project: null }).id
+db2.update('fact', noiseId, { keywords: ['别的', '无关'] })
+const hitNoise = buildHitInjection(db2, ws2, 's-noise', '测试', { hitTopK: 3 }, '.dsh-meow')
+check('hit uses keywords not full text', hitNoise === null || !hitNoise.text.includes('这段话的全文里出现了测试两个字'))
+const hitKw = buildHitInjection(db2, ws2, 's-kw', '别的无关', { hitTopK: 3 }, '.dsh-meow')
+check('hit matches keywords', hitKw !== null && hitKw.text.includes('这段话的全文里出现了测试两个字'))
+// 命中打分：LLM 关键词（多字词 bigram 化）可命中；虚词不产生命中
+db2.insert({ level: 'fact', content: 'LLM 关键词测试条目', project: null, keywords: ['记忆插件', '命中链路', '打分函数'] })
+const hitLlm = buildHitInjection(db2, ws2, 's-llm', '记忆插件命中', { hitTopK: 3 }, '.dsh-meow')
+check('hit matches llm keywords', hitLlm !== null && hitLlm.text.includes('LLM 关键词测试条目'))
+const hitVoid = buildHitInjection(db2, ws2, 's-void', '好的谢谢', { hitTopK: 3 }, '.dsh-meow')
+check('void words produce no hit', hitVoid === null || !hitVoid.text.includes('LLM 关键词测试条目'))
+// importance 权重：3 星优先于 1 星（同关键词）
+const impLow = db2.insert({ level: 'fact', content: '低重要度条目', project: null, importance: 1, keywords: ['权重对比'] }).id
+const impHigh = db2.insert({ level: 'fact', content: '高重要度条目', project: null, importance: 3, keywords: ['权重对比'] }).id
+const hitImp = buildHitInjection(db2, ws2, 's-imp', '权重对比', { hitTopK: 3 }, '.dsh-meow')
+check('importance boosts score', hitImp !== null && hitImp.text.indexOf('高重要度条目') < hitImp.text.indexOf('低重要度条目'))
+db2.update('fact', impLow, { status: 'archived' })
+db2.update('fact', impHigh, { status: 'archived' })
+// 覆盖率：多关键词条目靠单词碰瓷分低（被少关键词条目压过）
+db2.insert({ level: 'fact', content: '单词聚焦条目', project: null, keywords: ['唯一词'] })
+const hitCover = buildHitInjection(db2, ws2, 's-cover', '唯一词', { hitTopK: 3 }, '.dsh-meow')
+check('coverage favors focused entry', hitCover !== null && hitCover.text.includes('单词聚焦条目') && !hitCover.text.includes('LLM 关键词测试条目'))
+// 不检索本 session 建立的记忆（它们在上下文里，无需命中）
+const selfId = db2.insert({ level: 'fact', content: '本窗口刚写的独有命中词', project: null, source_session: 's-self' }).id
+const hitSelf = buildHitInjection(db2, ws2, 's-self', '独有命中词', { hitTopK: 3 }, '.dsh-meow')
+check('hit excludes own-session memory', hitSelf === null || !hitSelf.text.includes('本窗口刚写的独有命中词'))
+db2.update('fact', selfId, { status: 'archived' })
+// 命中条目带记忆时间戳（updated_at 相对时间）
+const datedId = db2.insert({ level: 'fact', content: '带时间戳的命中条目', project: null, updated_at: Date.now() - 2 * 86_400_000 }).id
+const hitDated = buildHitInjection(db2, ws2, 's-dated', '时间戳命中', { hitTopK: 3 }, '.dsh-meow')
+check('hit shows memory timestamp', hitDated !== null && hitDated.text.includes('2 天前'))
+db2.update('fact', datedId, { status: 'archived' })
+const searchRules = await searchTool.execute({ query: '全局铁律' }, projCtx)
+check('search default scope includes rules', searchRules.hits.some((h) => h.content.includes('全局铁律')))
+db.insert({ level: 'rules', content: 'femwa 设计铁律：语法错误必须报错', project: 'femwa', importance: 2 })
+const pjRules = await projectTool.execute({ project: 'femwa' }, projCtx)
+check('project rules injected in paragraph', pjRules.text.includes('设计原则') && pjRules.text.includes('语法错误必须报错'))
 
 // system prompt 手册：宿主有 systemPrompt 服务 → 注册 order 130 的静态 section；无 → 静默跳过
 const guideCtx = makeCtx()
@@ -361,8 +449,37 @@ const decisionA = await preStep(
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }] }),
 )
 check('pre-step injects', decisionA.kind === 'enter' && decisionA.messages[0].content[0].type === 'text' &&
-  decisionA.messages[0].content[0].text.includes('【soul 核心】'))
+  decisionA.messages[0].content[0].text.includes('===== 长期记忆 ====='))
 check('user text preserved', decisionA.messages[0].content[1].text === '你好')
+
+// 回归（真机 2026-08-16）：首条用户消息与插件通知同批到达（messages[0].source.kind='plugin'，
+// 如 user-approval 的 policy 变更通知）→ 快照必须仍注入到真实用户消息上，且命中链路不得在首轮触发。
+const notifAgent = { session: { header: { cwd: ws, id: 'apply-session-notif' }, events: [] }, steer: () => {} }
+const notifMsg = { content: [{ type: 'text', text: 'The approval policy changed from "ask" to "never" (changed by the user).' }], source: { kind: 'plugin', plugin: 'user-approval' } }
+const notifUserMsg = { content: [{ type: 'text', text: '首条带通知的消息' }], source: { kind: 'user' } }
+const decisionNotif = await preStep(
+  { agent: notifAgent, messages: [notifMsg, notifUserMsg], turn: 1, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [notifMsg, notifUserMsg] }),
+)
+check('snapshot injects into first user message despite leading plugin notice',
+  decisionNotif.kind === 'enter' &&
+  decisionNotif.messages[0].content.length === 1 && // 通知消息原样保留
+  decisionNotif.messages[1].content[0].type === 'text' &&
+  decisionNotif.messages[1].content[0].text.includes('===== 长期记忆 =====') &&
+  decisionNotif.messages[1].content[0].text.includes('本轮用户prompt：') &&
+  !decisionNotif.messages[1].content[0].text.includes('可能相关的记忆，仅供参考：'))
+
+// 恢复会话（进程重启后，日志已有历史用户消息）：快照不重复注入，命中链路照跑（第 N 条消息）
+const resumeAgent = { session: { header: { cwd: ws, id: 'apply-session-resume' }, events: [events.userMsg('之前')] }, steer: () => {} }
+setCurrentProject(ws, 'apply-session-resume', 'dsh', '.dsh-meow')
+const resumeMsg = { content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }
+const decisionResume = await preStep(
+  { agent: resumeAgent, messages: [resumeMsg], turn: 2, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [resumeMsg] }),
+)
+check('resumed session skips snapshot, hit chain runs', decisionResume.messages[0].content.length === 2 &&
+  decisionResume.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
+  !decisionResume.messages[0].content[0].text.includes('===== 长期记忆 ====='))
 
 // 同会话第二次 pre-step（Set 命中）→ 零开销放行，不再注入（回归：防重复注入膨胀上下文）
 const decisionA2 = await preStep(
@@ -371,6 +488,29 @@ const decisionA2 = await preStep(
 )
 check('no re-injection on second pre-step', decisionA2.messages[0].content.length === 1 &&
   decisionA2.messages[0].content[0].text === '第二条消息')
+
+// 命中链路（独立于首轮注入）：每条用户消息都检索命中（top-K），seen 去重
+setCurrentProject(ws, 'apply-session-1', 'dsh', '.dsh-meow')
+const agentA3 = { session: { header: { cwd: ws, id: 'apply-session-1' }, events: [] }, steer: () => {} }
+const decisionA3 = await preStep(
+  { agent: agentA3, messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }], turn: 3, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }] }),
+)
+check('per-message hit injects', decisionA3.messages[0].content.length === 2 &&
+  decisionA3.messages[0].content[0].text.includes('可能相关的记忆，仅供参考：') &&
+  decisionA3.messages[0].content[0].text.includes('本轮用户prompt：') &&
+  decisionA3.messages[0].content[0].text.includes('测试关键词修正'))
+const decisionA4 = await preStep(
+  { agent: agentA3, messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }], turn: 4, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '测试关键词' }], source: { kind: 'user' } }] }),
+)
+check('seen dedup on repeated message', decisionA4.messages[0].content.length === 1)
+// 工具轮（无用户消息）不触发命中
+const decisionA5 = await preStep(
+  { agent: agentA3, messages: [{ content: [{ type: 'tool-call', id: 'c', name: 'x', arguments: '{}' }], source: { kind: 'assistant' } }], turn: 4, step: 2, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [{ content: [{ type: 'tool-call', id: 'c', name: 'x', arguments: '{}' }], source: { kind: 'assistant' } }] }),
+)
+check('tool step skips hit chain', decisionA5.messages.length === 1 && decisionA5.messages[0].content.length === 1)
 
 // 已有历史 → 不注入
 const agentB = { session: { header: { cwd: ws, id: 's2' }, events: [events.userMsg('之前')] }, steer: () => {} }

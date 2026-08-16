@@ -17,6 +17,8 @@ export interface Doc {
   keywords: string[]
   importance: number
   created_at: number
+  /** 记忆时间戳 = 最后更新时间（艾宾浩斯按它算年龄）。 */
+  updated_at: number
 }
 
 const HAN = /[\u3400-\u9fff]/ // CJK 统一表意文字
@@ -134,7 +136,7 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
     if (raw[di] <= 0) continue
     let w = 1
     if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
-      w = recencyWeight(now - docs[di].created_at)
+      w = recencyWeight(now - docs[di].updated_at) // 艾宾浩斯按记忆时间戳（最后更新时间）
     }
     hits.push({
       id: docs[di].id,
@@ -147,6 +149,77 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
   }
   hits.sort((a, b) => b.score - a.score)
   return hits.slice(0, k)
+}
+
+/**
+ * 关键词命中打分（每消息命中链路专用）：
+ *   score = 交集分 × 覆盖率 × 艾宾浩斯(updated_at) × importance 权重 × title 加成
+ * - 匹配面 = 调用方准备的 docs.content（记忆 keywords 串，或旧条目回退的内容片段）+ title；
+ *   query = 用户消息全文 bigram；
+ * - 交集分 = Σ(命中的词条 × query 词频 × idf)——稀有词命中含金量高；
+ * - 覆盖率 = 命中词条数 / 该记忆匹配面词条总数——防"一个词碰瓷上榜"；
+ * - 艾宾浩斯按记忆时间戳（updated_at）衰减，importance≥3 或超级匹配（≥0.85×本轮最高交集分）豁免；
+ * - importance 权重 = 1 + (importance-1)×0.25（3 星 ×1.5）；title 被命中 ×1.2。
+ */
+export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
+  const k = opts.k ?? 2
+  const now = opts.now === undefined ? Date.now() : opts.now
+  const q = tokenize(query)
+  if (q.length === 0 || docs.length === 0) return []
+  const qTf = new Map<string, number>()
+  for (const t of q) qTf.set(t, (qTf.get(t) ?? 0) + 1)
+
+  const n = docs.length
+  const docToks = docs.map((d) => tokenize([d.content, d.title ?? ''].join(' ')))
+  const df = new Map<string, number>()
+  const tf: Array<Map<string, number>> = []
+  for (const toks of docToks) {
+    const m = new Map<string, number>()
+    const seen = new Set<string>()
+    for (const t of toks) {
+      m.set(t, (m.get(t) ?? 0) + 1)
+      if (!seen.has(t)) {
+        seen.add(t)
+        df.set(t, (df.get(t) ?? 0) + 1)
+      }
+    }
+    tf.push(m)
+  }
+  const idf = (t: string): number =>
+    Math.log(1 + (n - (df.get(t) ?? 0) + 0.5) / ((df.get(t) ?? 0) + 0.5))
+
+  const raw: number[] = docs.map((_, di) => {
+    let s = 0
+    for (const [t, f] of qTf) {
+      if (tf[di].has(t)) s += idf(t) * f
+    }
+    return s
+  })
+  const maxRaw = Math.max(...raw)
+  const out: RankedHit[] = []
+  for (let di = 0; di < docs.length; di++) {
+    if (raw[di] <= 0) continue
+    const len = docToks[di].length
+    let overlap = 0
+    for (const t of qTf.keys()) if (tf[di].has(t)) overlap++
+    const coverage = len > 0 ? overlap / len : 0
+    let w = 1
+    if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
+      w = recencyWeight(now - docs[di].updated_at)
+    }
+    const impW = 1 + (docs[di].importance - 1) * 0.25
+    const titleHit = tokenize(docs[di].title ?? '').some((t) => qTf.has(t))
+    out.push({
+      id: docs[di].id,
+      level: docs[di].level,
+      title: docs[di].title,
+      content: docs[di].content,
+      importance: docs[di].importance,
+      score: raw[di] * coverage * w * impW * (titleHit ? 1.2 : 1),
+    })
+  }
+  out.sort((a, b) => b.score - a.score)
+  return out.slice(0, k)
 }
 
 // ── topic 偏离信号 & find_similar ─────────────────────────────────────────

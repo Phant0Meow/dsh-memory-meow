@@ -7,38 +7,51 @@
 源自 "meow" 分支——因此得名——但可在任意 DSH profile 上使用。
 
 **核心理念**：每个工作区维护一份结构化记忆数据库（`.dsh-meow/memory.db`，基于 `node:sqlite`）。
-静态工具手册（六层结构 + 每个 `memory_*` 工具的用法）以固定 section 的形式放在 **system prompt** 里——
-文本恒定，因此不会破坏 LLM provider 的 KV/上下文缓存。动态内容（soul/user 全量、记忆索引、
-关键词命中的 fact/lesson）作为**第一条用户消息的前缀**注入。模型按需用 `memory_search` /
-`memory_find_similar` 深入检索。每个窗口由自己的主 agent 在夜间（"dream"）整理记忆，
+静态工具手册（七层结构 + 每个 `memory_*` 工具的用法）以固定 section 的形式放在 **system prompt** 里——
+文本恒定，因此不会破坏 LLM provider 的 KV/上下文缓存。动态内容（soul/user 全量、设计原则、
+记忆导引）作为**第一条用户消息的前缀**注入，且首轮只注入长期记忆、不做关键词命中；
+从第二轮起每条用户消息做关键词命中（top-2）。模型按需用 `memory_search` /
+`memory_project` 深入检索。每个窗口由自己的主 agent 在夜间（"dream"）整理记忆，
 且只整理自己的记忆——以窗口最后一次对话时间戳冻结其知识。
 
 ## ✨ 功能特性
 
-- **六层记忆**（`soul` = AI 自身 / `user` = 用户基本信息与偏好 / `project` = 项目信息，
+- **七层记忆**（`soul` = AI 自身 / `user` = 用户基本信息与偏好 / `project` = 项目信息，
   含 `subcategory`（overview/structure/decisions/quotes/ops/todo）/ `fact` = 原子事实 /
-  `lesson` = 教训与纠正 / `topic` = 进行中的讨论话题，带目标句）。每层一张 SQLite 表，
-  UUID 带时间前缀，id 顺序即创建顺序。
+  `lesson` = 教训与纠正 / `topic` = 进行中的讨论话题，带目标句 / `rules` = 设计原则与行为准则）。
+  每层一张 SQLite 表，UUID 带时间前缀，id 顺序即创建顺序。
+- **首轮注入（长期记忆块）**：第一条用户消息前注入固定格式
+  `===== 长期记忆 =====` → `【关于你】`（soul 全量）→ `【关于user】`（user 全量）→
+  `【设计原则】`（全局 rules 且 importance≥2，少而精的命令式准则）→ `【记忆导引】`
+  （用法说明 + 「用户的所有 project」动态列表，供 `memory_project` 选用）→
+  `===== 长期记忆结束 =====` + `本轮用户prompt：`。**首轮不跑关键词命中**（命中从第二轮起）。
+  即使首条用户消息与插件通知消息同批到达（如 approval policy 变更通知），快照仍注入到
+  真实用户消息上、命中绝不提前。
+- **每消息关键词命中**：从第二条用户消息起，每条真实用户消息都检索
+  fact/lesson/rules/topic（范围 = 全局 + 当前 project 锚定），top-2 命中以
+  「可能相关的记忆，仅供参考：」前缀注入。命中基于**条目关键词**（LLM 提取或自动
+  bigram）而非全文——全文匹配噪音大。打分 = 交集分 × idf × 覆盖率 × 艾宾浩斯衰减
+  （按记忆时间戳）× importance 权重 × title 加成。
+- **当前 project 锚定**：`memory_remember/search/update/project` 带 project 参数即锚定
+  该会话的当前项目；未锚定时命中只搜全局（用户闲聊不误伤）。
 - **缓存友好设计**：静态 `meow-memory:guide` section（order 130，紧随各 `tool:*` 说明之后）
-  在 system prompt 中注册一次——文本恒定，KV 缓存友好。动态快照（`soul`/`user` 全量 +
-  记忆索引 + 关键词命中的短 fact/lesson）作为第一条用户消息的前缀注入；system prompt 本身
-  不随会话变化，快照在整场会话中冻结。已见记忆（`injected` + `searched`）按会话记录，
-  绝不重复注入或重复检索；收到会话压缩信号（`compaction/*`）时释放已见记录，
-  允许压缩后被再次命中提取。首轮导引还会列出「用户的所有 project」（四表动态并集）
-  供 `memory_project` 选用。
-- **工具集**：`memory_remember`（写入，自动去重合并，返回读回确认：关键词/项目归属）/
+  在 system prompt 中注册一次——文本恒定，KV 缓存友好。已见记忆（`injected` + `searched`）
+  按会话记录（`.dsh-meow/sessions/<id>.json`），绝不重复注入或重复检索；收到会话压缩
+  信号（`compaction/*`）时释放已见记录，允许压缩后被再次命中提取。
+- **工具集**：`memory_remember`（写入，自动去重合并，返回读回确认：关键词/项目归属；
+  支持 keywords 参数——反思/dream 轮由 LLM 总结 5-10 个内容词，不传则自动 bigram 提取）/
   `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，按记忆时间戳排序）/
   `memory_project`（项目全景注入段落：按子标签分组、未过时条目全给、todo 输出
   「已完成：」最近 5 条 +「To do list：」，末尾附记忆库与会话历史定位说明）/
   `memory_find_similar`（查重与冲突检测）/ `memory_read` / `memory_update`（含 status
-  active/archived/stale、importance、goal）/ `memory_dream`（手动触发）。
-- **记忆时间戳**（`dream_at`）：每个窗口 dream 时以整理前的最后对话时间戳封存其条目——
-  后续窗口据此判断哪条更新。搜索结果按它重排，并带"冲突 → 最新为准"提示。
+  active/archived/stale、importance、goal、keywords 手动修正）/ `memory_dream`（手动触发）。
+- **记忆时间戳**（`updated_at` = 最后更新时间）：dream 封存或 `memory_update` 刷新时更新。
+  搜索结果按它重排，命中/注入带相对时间（如「2 天前」），并带"冲突 → 最新为准"提示。
 - **按窗口 dream**：夜间（按 `timeZone` 计算，默认 00:00–07:00，空闲时）每个最后发言
   晚于上次 dream 的窗口由自己的主 agent 整理——每个项目一组、一轮一组——使用其完整
   会话上下文。无 live agent 且超过 24h 的旧窗口、以及已归档的会话，均不处理。
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
-  被取消的轮次绝不触发。
+  最后工具是 `memory_*` 视为已主动记忆、不重复反思；被取消的轮次绝不触发。
 - **反思轮折叠 UI（client 端）**：记忆反思/dream 轮的 prompt 与后续 think/tool call/汇报
   折叠成一条横条（默认折叠，显示「新增记忆 N 条」），点击向下展开成卡片查看完整记录；
   原始消息流保持干净，工作汇报不再被记忆汇报刷屏。
@@ -85,7 +98,7 @@ npm install meow-memory
   config:
     enabled: true          # 总开关
     projectDir: '.dsh-meow' # 记忆目录（相对工作区）
-    hitTopK: 3             # 首条消息注入的关键词命中 fact/lesson 条数
+    hitTopK: 2             # 每条用户消息关键词命中的条目数上限（fact/lesson/rules/topic）
     reflect: true          # 连续 ≥reflectTurns 轮工具调用后自动反思
     reflectTurns: 7        # 触发反思所需的连续工具轮数
     dream:
@@ -101,17 +114,19 @@ npm install meow-memory
 ## 🧠 工作原理
 
 ```
-第一条用户消息                memory 工具                    夜间
-┌──────────────────┐          ┌──────────────────┐            ┌──────────────────────┐
-│ [soul 核心]       │          │ remember/search/  │            │ 按窗口 dream：        │
-│ [user 偏好]       │          │ find_similar/     │            │ 自己的记忆，按项目分组 │
-│ [记忆导引]        │          │ read/update       │            │ 一轮一组，dream_at     │
-│ [相关记忆 命中]    │          └──────────────────┘            │ 以 T 封存             │
-│ ─────────────    │          已见 id 按会话记录               └──────────────────────┘
-│ [user text]      │          (json)
-└──────────────────┘
-   每会话只注入一次，
-   绝不重复
+第一条用户消息（首轮）         第二条起的每条消息                夜间
+┌────────────────────┐        ┌────────────────────┐        ┌──────────────────────┐
+│ ===== 长期记忆 ===== │        │ 可能相关的记忆，仅供  │        │ 按窗口 dream：        │
+│ 【关于你】(soul)     │        │ 参考：keywords 命中   │        │ 自己的记忆，按项目分组 │
+│ 【关于user】         │        │ top-2（全局+当前     │        │ 一轮一组，updated_at   │
+│ 【设计原则】(rules)   │        │ project 锚定）      │        │ 以 T 封存             │
+│ 【记忆导引】          │        └────────────────────┘        └──────────────────────┘
+│ ─────────────      │        已见 id 按会话记录
+│ 本轮用户prompt：     │        (sessions/<id>.json)
+│ [user text]        │        压缩信号 → 释放已见
+└────────────────────┘
+ 每会话只注入一次，
+ 首轮不做命中
 ```
 
 ## 🛠 开发
@@ -119,7 +134,7 @@ npm install meow-memory
 ```sh
 npm install
 npm run build          # esbuild 打包 → lib/index.js（自包含）
-npm run test           # 86 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools
+npm run test           # 144 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace 中，不在本包的 `node_modules` 里。

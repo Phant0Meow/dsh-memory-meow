@@ -9,7 +9,7 @@
  *   topic       — title 必填 + goal 目标句（切换判定参照系）。
  *
  * id = 时间前缀（base36 毫秒 + 随机后缀，36 字符）：id 排序即创建顺序。
- * dream_at = 窗口 dream 封存时间戳（对外显示"记忆时间戳"）。
+ * updated_at = 记忆时间戳（最后更新时间：dream 封存或 memory_update 刷新；对外显示"记忆时间戳"）。
  * 驱动：node:sqlite（Node ≥22.5 内置，宿主 @deepseek-ai/dsh-storage-sqlite 同款）。
  */
 
@@ -18,10 +18,10 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic'
+export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
 export type Status = 'active' | 'archived' | 'stale'
 
-export const LEVELS: readonly Level[] = ['soul', 'user', 'project', 'fact', 'lesson', 'topic']
+export const LEVELS: readonly Level[] = ['soul', 'user', 'project', 'fact', 'lesson', 'topic', 'rules']
 
 /** project 子类（用户拍板）：目标概述/项目结构/技术决策/用户原话/部署与数据/进行中。 */
 export const PROJECT_SUBCATEGORIES = ['overview', 'structure', 'decisions', 'quotes', 'ops', 'todo'] as const
@@ -35,6 +35,18 @@ export const LEVEL_LABELS: Record<Level, string> = {
   fact: '原子事实',
   lesson: '错误与教训',
   topic: '话题',
+  rules: '设计原则与行为准则',
+}
+
+/** 相对时间显示（"记忆时间戳"人性化）。 */
+export function relativeTime(ms: number | null | undefined): string {
+  if (!ms) return '无时间戳'
+  const diff = Date.now() - ms
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3600_000)} 小时前`
+  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`
+  return new Date(ms).toISOString().slice(0, 10)
 }
 
 export interface MemoryRow {
@@ -52,9 +64,8 @@ export interface MemoryRow {
   source_session: string | null
   hit_count: number
   created_at: number
-  updated_at: number
+  updated_at: number // 记忆时间戳 = 最后更新时间（dream 封存或 memory_update 刷新）
   last_accessed_at: number | null
-  dream_at: number | null // 窗口 dream 封存时间（"记忆时间戳"）
 }
 
 export interface MemoryPatch {
@@ -67,7 +78,6 @@ export interface MemoryPatch {
   project?: string | null
   subcategory?: ProjectSubcategory | null
   goal?: string | null
-  dream_at?: number | null
 }
 
 /** 时间前缀 id：base36(毫秒,9位) + '-' + 26 位随机 = 36 字符，id 排序 ≈ 创建顺序。 */
@@ -87,8 +97,7 @@ const COMMON_COLS = `
   hit_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  last_accessed_at INTEGER,
-  dream_at INTEGER
+  last_accessed_at INTEGER
 `
 
 /** level → 建表语句（差异列按层特化）。表名来自 LEVELS 枚举，不拼外部输入。 */
@@ -106,6 +115,8 @@ const SCHEMAS: Record<Level, string> = {
   topic: `CREATE TABLE IF NOT EXISTS topic (${COMMON_COLS},
     goal TEXT,
     project TEXT)`,
+  rules: `CREATE TABLE IF NOT EXISTS rules (${COMMON_COLS},
+    project TEXT)`, // project 可空：null=全局准则（高 importance 全量注入），非空=项目特定（memory_project 注入）
 }
 
 /** 记忆库路径：workspace 是项目根（cwd），目录名单独传（防双拼）。 */
@@ -137,13 +148,18 @@ export class MemoryDb {
     this.upgrade()
   }
 
-  /** 幂等升级：缺列补列；旧 UUID id 按 created_at 重排为时间前缀 id。 */
+  /** 幂等升级：缺列补列；旧 UUID id 按 created_at 重排为时间前缀 id；
+   *  v0.7.0：dream_at 列并入 updated_at（记忆时间戳=最后更新时间）后删除。 */
   private upgrade(): void {
     for (const level of LEVELS) {
       const cols = new Set(
         (this.db.prepare(`PRAGMA table_info(${level})`).all() as Array<{ name: string }>).map((c) => c.name),
       )
-      if (!cols.has('dream_at')) this.db.exec(`ALTER TABLE ${level} ADD COLUMN dream_at INTEGER`)
+      if (cols.has('dream_at')) {
+        // 旧库：记忆时间戳数据合并进 updated_at（取两者较新值），再删 dream_at 列。
+        this.db.exec(`UPDATE ${level} SET updated_at = MAX(COALESCE(updated_at, 0), COALESCE(dream_at, 0)) WHERE dream_at IS NOT NULL`)
+        this.db.exec(`ALTER TABLE ${level} DROP COLUMN dream_at`)
+      }
       if (level === 'project' && !cols.has('subcategory')) {
         this.db.exec('ALTER TABLE project ADD COLUMN subcategory TEXT')
       }
@@ -185,18 +201,17 @@ export class MemoryDb {
       created_at: row.created_at ?? now,
       updated_at: row.updated_at ?? now,
       last_accessed_at: row.last_accessed_at ?? null,
-      dream_at: row.dream_at ?? null,
     }
     this.db
       .prepare(
-        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at, dream_at
+        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at
           ${full.level === 'project' ? ', project, subcategory' : ''}
-          ${full.level === 'fact' || full.level === 'lesson' ? ', project' : ''}
+          ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', project' : ''}
           ${full.level === 'lesson' ? ', corrected' : ''}
           ${full.level === 'topic' ? ', goal, project' : ''}
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           ${full.level === 'project' ? ', ?, ?' : ''}
-          ${full.level === 'fact' || full.level === 'lesson' ? ', ?' : ''}
+          ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', ?' : ''}
           ${full.level === 'lesson' ? ', ?' : ''}
           ${full.level === 'topic' ? ', ?, ?' : ''}
         )`,
@@ -213,9 +228,8 @@ export class MemoryDb {
         full.created_at,
         full.updated_at,
         full.last_accessed_at,
-        full.dream_at,
         ...(full.level === 'project' ? [full.project ?? '', full.subcategory] : []),
-        ...(full.level === 'fact' || full.level === 'lesson' ? [full.project] : []),
+        ...(full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? [full.project] : []),
         ...(full.level === 'lesson' ? [full.corrected] : []),
         ...(full.level === 'topic' ? [full.goal, full.project] : []),
       )
@@ -253,9 +267,8 @@ export class MemoryDb {
     if (patch.subcategory !== undefined && level === 'project') push('subcategory', patch.subcategory)
     if (patch.goal !== undefined && level === 'topic') push('goal', patch.goal)
     if (patch.project !== undefined && level === 'topic') push('project', patch.project)
-    if (patch.dream_at !== undefined) push('dream_at', patch.dream_at)
     if (sets.length === 0) return false
-    push('updated_at', Date.now())
+    push('updated_at', Date.now()) // 记忆时间戳 = 最后更新时间（任何 update 都刷新）
     const where = id.length < 36 ? 'id LIKE ?' : 'id = ?'
     const res = this.db.prepare(`UPDATE ${level} SET ${sets.join(', ')} WHERE ${where}`).run(...args, id.length < 36 ? `${id}%` : id)
     return res.changes > 0
@@ -268,7 +281,7 @@ export class MemoryDb {
       where.push('status = ?')
       args.push(opts.status)
     }
-    if (opts.project !== undefined && (level === 'project' || level === 'fact' || level === 'lesson')) {
+    if (opts.project !== undefined && (level === 'project' || level === 'fact' || level === 'lesson' || level === 'rules')) {
       where.push('project = ?')
       args.push(opts.project)
     }
@@ -307,11 +320,11 @@ export class MemoryDb {
     return row.n
   }
 
-  /** 全部出现过（含已过时）的项目名：project/fact/lesson/topic 四表的 project 列并集。
+  /** 全部出现过（含已过时）的项目名：project/fact/lesson/topic/rules 五表的 project 列并集。
    *  供记忆导引列出"用户的所有 project"（动态派生，无需手工维护）。 */
   listProjectNames(): string[] {
     const names = new Set<string>()
-    for (const level of ['project', 'fact', 'lesson', 'topic'] as const) {
+    for (const level of ['project', 'fact', 'lesson', 'topic', 'rules'] as const) {
       const rows = this.db.prepare(`SELECT project FROM ${level} WHERE project IS NOT NULL AND project != ''`).all() as Array<{ project: string }>
       for (const r of rows) names.add(r.project)
     }
@@ -373,7 +386,7 @@ export class MemoryDb {
     }>
   }
 
-  /** 本窗口建立的全部条目 id（dream 收尾：dream_at 批量写入用）。 */
+  /** 本窗口建立的全部条目 id（dream 收尾：updated_at 批量写入用）。 */
   idsBySession(sessionId: string): Array<{ level: Level; id: string }> {
     const out: Array<{ level: Level; id: string }> = []
     for (const level of LEVELS) {
@@ -383,11 +396,12 @@ export class MemoryDb {
     return out
   }
 
-  /** 批量写 dream_at（dream 收尾：本次窗口封存）。 */
+  /** 批量写记忆时间戳（dream 收尾：本窗口条目 updated_at = 窗口最后对话时间 T；
+   *   MAX 防止覆盖 T 之后的 memory_update 刷新）。 */
   stampDream(sessionId: string, time: number): number {
     let n = 0
     for (const { level, id } of this.idsBySession(sessionId)) {
-      n += this.db.prepare(`UPDATE ${level} SET dream_at = ? WHERE id = ?`).run(time, id).changes
+      n += this.db.prepare(`UPDATE ${level} SET updated_at = MAX(updated_at, ?) WHERE id = ?`).run(time, id).changes
     }
     return n
   }
@@ -416,7 +430,6 @@ export class MemoryDb {
       created_at: Number(r.created_at),
       updated_at: Number(r.updated_at),
       last_accessed_at: r.last_accessed_at == null ? null : Number(r.last_accessed_at),
-      dream_at: r.dream_at == null ? null : Number(r.dream_at),
     }
   }
 }

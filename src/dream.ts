@@ -7,11 +7,11 @@
  * - 按 project 分组逐轮处理（每轮一个项目域，注意力友好）；无 project 标签的最后统一一轮。
  * - 组内排序：project → level（project→topic→fact→lesson）→ 创建时间。
  * - T = dream 开始前窗口最后一轮正常对话时间（先记死）；收尾时该窗口所有条目
- *   dream_at = T（"记忆时间戳"），windows 表 last_dream_time = T。
+ *   updated_at = T（"记忆时间戳"=最后更新时间），windows 表 last_dream_time = T。
  * - 判定：窗口最后事件时间 > 24h 前 且 > 上次 dream 时间 → 需要 dream。
  * - 串行：同一时刻只有一个进行中的 dream 任务；旧窗口（无 live agent）不碰。
  *
- * 冲突处理：memory_search 返回 top-k 后按 dream_at 重排 + 顶部提示；
+ * 冲突处理：memory_search 返回 top-k 后按 updated_at 重排 + 顶部提示；
  * agent 据"记忆时间戳"判断新旧（工具层乐观锁留待迭代）。
  */
 
@@ -89,8 +89,10 @@ const DREAM_RULES = [
   '5. 核查 importance：重要决策/红线/教训 → 2 或 3；琐碎 → 1；',
   '6. 更新事件最新进展与 todo：topic 重写【经过/结果】段；project 的 todo 子类完成 → 标 stale（视为 done）；',
   '7. topic 创建/更新必须带 project 参数（所属项目名）；',
-  '8. 改动前若怀疑重复，先 memory_find_similar 查重；',
-  '9. 完成后直接回复"本组整理完成"，不要调用其他工具。',
+  '8. 写/改记忆时，同时总结该记忆的关键词（提取 5-10 个内容词，如"记忆插件"；别提取虚词），随 memory_remember/memory_update 的 keywords 参数提交；',
+  '9. rules（设计原则/行为准则）：全局准则不填 project 且 importance≥2 才会全量注入首轮，别把具体踩坑当 rules 写（踩坑进 lesson）；',
+  '10. 改动前若怀疑重复，先 memory_find_similar 查重；',
+  '11. 完成后直接回复"本组整理完成"，不要调用其他工具。',
 ].join('\n')
 
 /** 构造一组 dream 指令消息。 */
@@ -181,7 +183,7 @@ export function advanceDream(agent: unknown): void {
     return
   }
 
-  // 收尾：全部条目 dream_at = T（封存语义不变）；窗口 last_dream_time = dream 完成时刻
+  // 收尾：全部条目 updated_at = T（封存语义不变）；窗口 last_dream_time = dream 完成时刻
   // （不是 T！dream 轮本身会产生会话事件推后 last_event_time，若记 T 则
   // last_dream_time < last_event_time 永远成立 → 窗口永远"需要 dream" 无限重复）。
   const stamped = db.stampDream(task.sessionId, task.T)
@@ -285,6 +287,10 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
       const db = getDb(workspace, dir)
       const w = db.getWindow(sessionId)
       if (!w || !windowNeedsDream(w)) continue
+      // 窗口级 idle（用户拍板：session 最近 idleMinutes 无动作才 dream）：
+      // 用 db 持久化的 last_event_time 判定——不受模块实例/热重载影响
+      // （内存全局 lastActivity 只作快速路径，见上方 gate）。
+      if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) continue
       const agent =
         liveAgents.get(sessionId) ??
         (typeof ctx.agents?.get === 'function' ? ctx.agents.get(sessionId) : undefined)

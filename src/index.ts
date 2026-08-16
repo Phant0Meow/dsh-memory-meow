@@ -3,7 +3,7 @@
  *
  * 设计（2026-08-15 与用户拍板）：
  * - SQLite 结构化存储（node:sqlite，宿主同款），每 level 一表：
- *   soul / user / project / fact / lesson / topic；id=时间前缀（排序=创建顺序）。
+ *   soul / user / project / fact / lesson / topic / rules；id=时间前缀（排序=创建顺序）。
  * - 注入：会话开头 soul/user 全量 + 记忆导引（project/topic 标题列表，正文自取）
  *   + 第一条用户消息关键词命中 fact/lesson 短条目；无每轮注入。
  * - 去重：.dsh-meow/sessions/<sessionId>.json 记录本会话注入过的 memory id。
@@ -12,7 +12,7 @@
  * - 反思：干过活的 turn 结束后引导模型记忆；topic 用目标句规则归属，
  *   关键词偏离信号只提醒不拍板，重写附底稿。
  * - dream：按窗口夜间整理——每个窗口由自己的主 agent 整理自己建立的记忆，
- *   按 project 分组逐轮，dream_at 封存（"记忆时间戳"）；串行；旧窗口不碰。
+ *   按 project 分组逐轮，updated_at 封存（"记忆时间戳"=最后更新时间）；串行；旧窗口不碰。
  * - 迁移：首次打开库时把旧 PROJECT.md 导入 SQLite，文件改名 .imported 留底。
  */
 
@@ -31,7 +31,7 @@ import {
   scheduleDream,
   type DreamConfig,
 } from './dream.js'
-import { buildInjection, markSearched, readInjected, releaseSeen } from './inject.js'
+import { buildHitInjection, buildInjection, markSearched, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { registerMemoryTools } from './tools.js'
@@ -47,16 +47,17 @@ export const inject = ['tools']
  * 文本恒定、不随会话变化 → 前缀稳定，KV 缓存友好；动态记忆内容（soul/user/
  * 导引/命中）仍走首条消息注入。文案与 tools.ts 的工具 schema 保持一致。
  */
-export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆（SQLite 六层：soul=AI自身 / user=用户偏好 /
+export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆（SQLite 七层：soul=AI自身 / user=用户偏好 /
 project=项目（含子类 overview/structure/decisions/quotes/ops/todo）/ fact=原子事实 /
-lesson=教训 / topic=话题）。记忆按"记忆时间戳"排序，冲突以最新为准，旧的可作过程参考。
+lesson=教训 / topic=话题 / rules=设计原则与行为准则）。记忆按"记忆时间戳"排序，冲突以最新为准，旧的可作过程参考。
 工具：
 - memory_remember —— 写记忆。必填 content；level 选层（默认 fact）；project 记项目名
   （femwa/meow-memory/meow-eyes/dsh…，level=project 必填）；fact/lesson 一句话 ≤60 字；
+  rules=设计原则/行为准则：全局准则不填 project 且 importance≥2（会全量注入首轮），项目特定准则填 project；
   topic 需 title（建议配 goal 目标句与 project 项目名）；用户介绍设计思路/框架/决策理由的原话必须保留措辞不转述；
   写前可先 memory_find_similar 查重。
 - memory_search —— 检索。只返回其他会话建立的记忆（本会话已注入/已检索的自动排除）；
-  默认搜 fact/lesson/topic；支持 level 逗号多选、project/status/days 过滤；k 1-50。
+  默认搜 fact/lesson/topic/rules；支持 level 逗号多选、project/status/days 过滤；k 1-50。
 - memory_project —— 当你需要全面了解某个项目的整体概述、设计历史、技术决策、用户原话或进度时使用。
 - memory_find_similar —— 按 id 找内容相似条目（查重/找冲突用）。
 - memory_read —— 读完整条目（含元数据）。
@@ -96,8 +97,8 @@ export const Config = z.object({
   enabled: z.boolean().default(true),
   /** 记忆目录（相对工作区）。 */
   projectDir: z.string().default('.dsh-meow'),
-  /** 关键词命中条数上限（fact/lesson 短条目）。 */
-  hitTopK: z.number().min(0).max(10).default(3),
+  /** 关键词命中条数上限（fact/lesson/rules/topic 短条目，每条用户消息命中注入）。 */
+  hitTopK: z.number().min(0).max(10).default(2),
   /** 导引标题截断长度。 */
   titleMax: z.number().min(10).max(200).default(40),
   /** 是否在 ReAct 任务结束后自动注入反思。 */
@@ -138,7 +139,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
-    hitTopK: c.hitTopK ?? 3,
+    hitTopK: c.hitTopK ?? 2,
     titleMax: c.titleMax ?? 40,
     reflect: c.reflect ?? true,
     reflectTurns: c.reflectTurns ?? 7,
@@ -246,10 +247,15 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     windowIndex.set(sid, cwd)
   })
 
-  // 1) 第一条用户消息注入记忆块。
-  // 只注入一次：内存 Set 命中 → 热路径直接放行（绝不重复注入/检索）；
-  // Set miss（进程重启后）→ 反向扫描尾部兜底，历史已有 user/message 视为已注入。
-  const injectedSessions = new Set<string>()
+  // 1) 注入：首轮快照（soul/user/设计原则/导引，仅一次）+ 命中链路（第二条起每条真实用户消息都跑）。
+  // 首轮判定（真机踩坑 2026-08-16）：不能看 decision.messages[0]——首条用户消息可能与
+  // 插件通知消息同批到达（如 user-approval 的 policy 变更通知，source.kind='plugin'），
+  // messages[0] 未必是用户消息。正确判定 = 本会话日志里还没有任何 user/message
+  // （harness 在 pre-step 之后才 append 当前消息，首条消息时日志必为空）+ 消息列表里
+  // 存在真实用户消息（source.kind === 'user'）。
+  // 首条消息：只注入长期记忆快照，绝不跑命中链路（用户拍板：命中从第二轮起）。
+  // 进程重启后恢复的会话：日志已有 user/message → 视为首轮已注入，只走命中链路。
+  const firstUserHandled = new Set<string>()
   ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<unknown> => {
     const t0 = Date.now()
     const decision = await next()
@@ -259,56 +265,73 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     if (agent.session.header.parentSession !== undefined) return decision
     registerLiveAgent(agent)
     const sid = sessionIdOfAgent(agent)
-    if (injectedSessions.has(sid)) {
-      if (Date.now() - t0 > 10) perf(`pre-step hot ${Date.now() - t0}ms sid=${sid.slice(0, 8)}`) // 热路径超 10ms 有鬼
-      return decision // 已注入：零开销放行
-    }
-    {
-      const evs = agent.session.events
-      let hasUser = false
-      for (let i = evs.length - 1; i >= 0; i--) {
-        const e = evs[i] as { type?: string }
-        if (e?.type === 'user/message') {
-          hasUser = true
-          break
-        }
-        if (e?.type === 'turn/start' && evs.length - i > 300) break // 最多回看 300 事件
-      }
-      if (hasUser) {
-        injectedSessions.add(sid)
-        return decision
-      }
-    }
-    // 只对真实用户消息注入（source.kind === 'user'）。
-    const first = decision.messages[0]
-    if (first.source.kind !== 'user') return decision
-
     const ws = workspaceOfAgent(agent)
-    if (!ws) return decision
-    const db = getDb(ws, resolved.projectDir)
-    if (resolved.autoMigrate && existsSync(join(ws, resolved.projectDir, 'PROJECT.md'))) {
-      const n = migrateLegacy(db, ws, resolved.projectDir)
-      if (n !== null) ctx.logger.info(`meow-memory: migrated legacy PROJECT.md → SQLite (${n} entries)`)
+
+    // 真实用户消息（跳过插件通知等，source.kind='plugin' 的进不来）。
+    const userMsgs = decision.messages.filter((m) => m.source?.kind === 'user')
+    if (userMsgs.length === 0) return decision // 工具轮/纯插件消息：不注入
+
+    // 首条用户消息（本进程内每个会话只判定一次）。
+    if (!firstUserHandled.has(sid)) {
+      firstUserHandled.add(sid)
+      let priorUser = 0
+      for (const e of agent.session.events) {
+        if ((e as { type?: string })?.type === 'user/message') priorUser++
+      }
+      if (priorUser === 0) {
+        // 会话首条消息：只注入长期记忆快照，不跑命中链路。
+        if (ws) {
+          const firstUser = userMsgs[0]
+          const db = getDb(ws, resolved.projectDir)
+          if (resolved.autoMigrate && existsSync(join(ws, resolved.projectDir, 'PROJECT.md'))) {
+            const n = migrateLegacy(db, ws, resolved.projectDir)
+            if (n !== null) ctx.logger.info(`meow-memory: migrated legacy PROJECT.md → SQLite (${n} entries)`)
+          }
+          const firstText = firstUser.content
+            .filter((b: { type?: string; text?: string }) => b.type === 'text' && typeof b.text === 'string')
+            .map((b: { text?: string }) => b.text ?? '')
+            .join(' ')
+          const injected = buildInjection(db, ws, sid, firstText, {
+            hitTopK: resolved.hitTopK,
+            titleMax: resolved.titleMax,
+          }, resolved.projectDir)
+          if (injected) {
+            const rewritten = decision.messages.map((m) => m === firstUser
+              ? { ...m, content: [{ type: 'text', text: injected.text }, ...m.content] }
+              : m)
+            ctx.logger.info(`meow-memory: injected memory block (${injected.text.length} chars) before first user message`)
+            return { ...decision, messages: rewritten }
+          }
+        }
+        return decision // 首条消息：不跑命中链路（首轮只注入长期记忆）
+      }
+      // 恢复的会话（日志已有历史消息）：首轮快照由上个进程注入过，只走命中链路。
     }
 
-    const firstText = first.content
-      .filter((b: { type?: string; text?: string }) => b.type === 'text' && typeof b.text === 'string')
-      .map((b: { text?: string }) => b.text ?? '')
-      .join(' ')
-
-    const injected = buildInjection(db, ws, sid, firstText, {
-      hitTopK: resolved.hitTopK,
-      titleMax: resolved.titleMax,
-    }, resolved.projectDir)
-    if (!injected) return decision
-    injectedSessions.add(sid)
-
-    const rewritten = [
-      { ...first, content: [{ type: 'text', text: injected.text }, ...first.content] },
-      ...decision.messages.slice(1),
-    ]
-    ctx.logger.info(`meow-memory: injected memory block (${injected.text.length} chars) before first user message`)
-    return { ...decision, messages: rewritten }
+    // 命中链路（从第二条用户消息起）：每条含真实用户消息的请求都跑关键词检索命中
+    // （top-K）。工具轮/子步骤的请求消息不含真实用户消息 → 不触发；
+    // 命中 id 记入已见，不再重复。
+    if (ws) {
+      const lastUser = [...decision.messages].reverse().find((m) => m.source?.kind === 'user')
+      if (lastUser !== undefined) {
+        const text = lastUser.content
+          .filter((b: { type?: string; text?: string }) => b.type === 'text' && typeof b.text === 'string')
+          .map((b: { text?: string }) => b.text ?? '')
+          .join(' ')
+        const hit = buildHitInjection(getDb(ws, resolved.projectDir), ws, sid, text, {
+          hitTopK: resolved.hitTopK,
+          titleMax: resolved.titleMax,
+        }, resolved.projectDir)
+        if (hit !== null) {
+          const rewritten = decision.messages.map((m) => m === lastUser
+            ? { ...m, content: [{ type: 'text', text: hit.text }, ...m.content] }
+            : m)
+          return { ...decision, messages: rewritten }
+        }
+      }
+      if (Date.now() - t0 > 10) perf(`pre-step hit ${Date.now() - t0}ms sid=${sid.slice(0, 8)}`) // 热路径超 10ms 有鬼
+    }
+    return decision
   })
 
   // 2) turn 结束：dream 轮推进 / 自动反思。
@@ -357,7 +380,7 @@ const windowIndex = new Map<string, string>()
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES } from './db.js'
 export { migrateLegacy } from './migrate.js'
-export { buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile } from './inject.js'
+export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity, hourInTimeZone } from './dream.js'

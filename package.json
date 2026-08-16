@@ -1,7 +1,7 @@
 {
   "name": "meow-memory",
-  "version": "0.5.1",
-  "description": "Cross-session project memory for DeepSeek Harness: six-layer SQLite memory, first-message snapshot injection, memory_remember/search/project tools, automatic reflection with reflection-fold UI, and nightly dream consolidation.",
+  "version": "0.8.1",
+  "description": "Cross-session project memory for DeepSeek Harness: seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, memory_remember/search/project tools, automatic reflection with reflection-fold UI, and nightly dream consolidation.",
   "keywords": [
     "deepseek-harness",
     "dsh",
