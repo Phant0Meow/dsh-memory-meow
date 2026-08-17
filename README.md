@@ -52,9 +52,16 @@
   会话上下文。无 live agent 且超过 24h 的旧窗口、以及已归档的会话，均不处理。
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
   最后工具是 `memory_*` 视为已主动记忆、不重复反思；被取消的轮次绝不触发。
+- **注入折叠 UI（client 端）**：首轮长期记忆 / 每消息关键词命中的注入文本在前端
+  折叠成「▸ 已注入记忆（长期记忆/关键词命中）」横条（与用户气泡同宽），点开可查看
+  注入全文；用户 prompt 以气泡形式直接显示，消息流干净不被注入刷屏。纯文本消息才折叠
+  （带附件的保持原样）。
 - **反思轮折叠 UI（client 端）**：记忆反思/dream 轮的 prompt 与后续 think/tool call/汇报
-  折叠成一条横条（默认折叠，显示「新增记忆 N 条」），点击向下展开成卡片查看完整记录；
-  原始消息流保持干净，工作汇报不再被记忆汇报刷屏。
+  折叠成一条横条（默认折叠，显示「新增记忆 N 条」/「记忆梦境任务」），点击向下展开成
+  卡片查看完整记录——卡片内 Think / tool call / 上下文注入均可点开查看细节。
+- **dream 防重复**：check 门（DB 原子 60s 检查节流）+ start 幂等抢占（`dream_pending`）+
+  中断自愈（未收尾的 dream 自动补收尾）+ 孤儿收尾（跨实例/热重载后 turn 结束也能收尾）；
+  插件注入轮的事件不刷新窗口活跃度——已 dream 的窗口不会反复被 dream。
 - **零运行时依赖**：`node:sqlite`（Node ≥22.5 内置）+ 自包含 esbuild 产物（`lib/index.js`）。
   无原生模块。
 
@@ -67,12 +74,10 @@
 cd $DSH_HOME/profiles/web          # 默认 home: ~/.dsh/profiles/web
 npm install meow-memory
 
-# 2. 在 profile 的 cordis.patch.yml 中注册：
-#    - insert:
-#        - id: meow-memory
-#          name: 'meow-memory'
-#          config:
-#            enabled: true
+# 2. 在 profile 的 package.json 中把包加进装配 bundles（推荐，v0.9.0 起）：
+#    "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "meow-memory"] } }
+#    （插件自带 dsh.bundle.patch，bundle 机制自动装配；profile patch 的 insert
+#     按 id 寻址、找不到已有条目会报 not found——新增插件请走 bundles 数组。）
 
 # 3. 重启 dsh web。新会话自动加载插件。
 ```
@@ -85,7 +90,7 @@ npm install meow-memory
    ln -s /path/to/meow-memory ~/.dsh/profiles/web/node_modules/meow-memory
    ```
    （Windows：`New-Item -ItemType Junction ...` —— NTFS junction，无需管理员权限。）
-2. 在 profile 的 `cordis.patch.yml` 中注册（同样的 insert 块）。
+2. 把 `meow-memory` 加进 profile `package.json` 的 `dsh.profile.bundles`（同上）。
 3. 重启 `dsh web`。新会话自动加载插件。
 
 ## ⚙️ 配置

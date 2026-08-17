@@ -18,7 +18,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb } from './db.js'
@@ -57,8 +57,10 @@ lesson=教训 / topic=话题 / rules=设计原则与行为准则）。记忆按"
   rules=设计原则/行为准则：全局准则不填 project 且 importance≥2（会全量注入首轮），项目特定准则填 project；
   topic 需 title（建议配 goal 目标句与 project 项目名）；用户介绍设计思路/框架/决策理由的原话必须保留措辞不转述；
   写前可先 memory_find_similar 查重。
-- memory_search —— 检索。只返回其他会话建立的记忆（本会话已注入/已检索的自动排除）；
-  默认搜 fact/lesson/topic/rules；支持 level 逗号多选、project/status/days 过滤；k 1-50。
+- memory_search —— 检索（query 必填且不能为空：传关键词/句子，如 "记忆插件 部署"；
+  浏览项目全貌用 memory_project，不要空 query 调本工具）。只返回其他会话建立的记忆
+  （本会话已注入/已检索的自动排除）；默认搜 fact/lesson/topic/rules；支持 level 逗号
+  多选、project/status/days 过滤；k 1-50。
 - memory_project —— 当你需要全面了解某个项目的整体概述、设计历史、技术决策、用户原话或进度时使用。
 - memory_find_similar —— 按 id 找内容相似条目（查重/找冲突用）。
 - memory_read —— 读完整条目（含元数据）。
@@ -161,6 +163,8 @@ interface SessionHeaderLike {
   cwd?: string
   id?: string
   parentSession?: unknown
+  /** 子代理权威标记（dsh：origin === 'subagent'）；GUI fork 的会话只有 parentSession 无 origin。 */
+  origin?: unknown
 }
 
 /** 工作区 = 会话 cwd（项目根）；目录名 projectDir 单独下传给各模块（防双拼）。 */
@@ -204,9 +208,19 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
   }
   applyCount++
   perf(`apply #${applyCount} pid=${process.pid}`)
+  loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
+  perf(`window-index restored ${windowIndex.size} windows`)
 
-  registerMemoryTools((t) => ctx.tools.register(t), resolved.projectDir)
-  ctx.tools.register(dreamTool(ctx, resolved.projectDir))
+  // 工具注册 + disposer 收集：热重载/重启时旧 fiber 的工具必须注销，
+  // 否则新 apply 重复注册同名工具会抛异常 → apply 中断 → 工具/手册/pre-step 全失效
+  // （真机踩坑 2026-08-17：04:35 配置变更触发的 reload 后首轮注入消失）。
+  const toolDisposers: Array<() => void> = []
+  registerMemoryTools((t) => {
+    const dispose = ctx.tools.register(t)
+    if (typeof dispose === 'function') toolDisposers.push(dispose)
+  }, resolved.projectDir)
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir))
+  if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
   // 记忆系统手册挂进 system prompt（静态文本 → KV 缓存友好；order 130 = 工具指南区间末尾，
@@ -219,25 +233,41 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
 
   // 窗口表：只处理低频事件类型（流式 assistant/chunk 每块一个事件，绝不逐块写库）。
   // 节流：同一窗口 5 秒内最多落库一次（内存记 lastWrite，事件循环零阻塞）。
+  // 插件注入轮（反思/dream 的 steer 消息轮）内的事件不刷新 last_event_time：
+  // dream 轮自身事件会推后窗口活跃度 → 收尾后 last_dream_time < last_event_time
+  // → 窗口永远"需要 dream"，配合中断/多进程场景造成反复 dream。
   const lastWindowWrite = new Map<string, number>()
-  ctx.on('session/event', (session: { id?: string; header?: SessionHeaderLike }, event: { time?: number; type?: string }) => {
+  const isPluginTurn = new Map<string, boolean>() // sid -> 本 turn 是否为 meow-memory 插件轮
+  ctx.on('session/event', (session: { id?: string; header?: SessionHeaderLike }, event: { time?: number; type?: string; data?: unknown }) => {
     perfEvent()
     noteActivity()
     const t = event?.type
+    const sid = session?.id
+    const cwd = session?.header?.cwd
     // 压缩信号：会话历史被压缩（内容已不在上下文）→ 释放本会话已见记录，
     // 允许之前注入/检索过的记忆被再次命中提取。
     if (t === 'compaction/summary' || t === 'compaction/start') {
-      const sid = session?.id
-      const cwd = session?.header?.cwd
       if (typeof sid === 'string' && typeof cwd === 'string') {
         releaseSeen(cwd, sid, resolved.projectDir)
         ctx.logger.info(`meow-memory: compaction signal, released seen memory for session ${shortSessionId(sid)}`)
       }
       return
     }
+    if (typeof sid === 'string') {
+      if (t === 'turn/start') {
+        isPluginTurn.set(sid, false) // 新轮重置
+        return
+      }
+      if (t === 'user/message') {
+        const src = (event.data as { source?: { kind?: string; plugin?: string } } | undefined)?.source
+        if (src?.kind === 'plugin' && src.plugin === 'meow-memory') {
+          isPluginTurn.set(sid, true) // 反思/dream 指令轮
+          return // 指令消息本身也不刷新活跃度
+        }
+      }
+      if (isPluginTurn.get(sid)) return // 插件轮内：不 touchWindow
+    }
     if (t !== 'user/message' && t !== 'turn/end' && t !== 'assistant/message' && t !== 'tool/result') return
-    const sid = session?.id
-    const cwd = session?.header?.cwd
     if (typeof sid !== 'string' || typeof cwd !== 'string' || typeof event?.time !== 'number') return
     const now = Date.now()
     const last = lastWindowWrite.get(sid) ?? 0
@@ -246,6 +276,7 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     const db = getDb(cwd, resolved.projectDir)
     db.touchWindow(sid, cwd, event.time)
     windowIndex.set(sid, cwd)
+    persistWindowIndex() // 窗口索引落盘（热重载/重启后恢复）
   })
 
   // 1) 注入：首轮快照（soul/user/设计原则/导引，仅一次）+ 命中链路（第二条起每条真实用户消息都跑）。
@@ -262,8 +293,10 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     const decision = await next()
     if (decision === undefined || decision.kind !== 'enter' || signal.aborted) return decision
     if (decision.messages.length === 0) return decision
-    // 子代理不注入：它们的 prompt 由父代理提供（如 dsh-femwa 的角色上下文）。
-    if (agent.session.header.parentSession !== undefined) return decision
+    // 子代理不注入（origin === 'subagent'，dsh 权威标记）：它们的 prompt 由父代理提供
+    // （如 dsh-femwa 的角色上下文）。注意不能只看 parentSession——GUI fork/续写的
+    // 主会话也有 parentSession（真机踩坑 2026-08-17：fca10feb 被误判为子代理导致注入全失效）。
+    if (agent.session.header.origin === 'subagent') return decision
     registerLiveAgent(agent)
     const sid = sessionIdOfAgent(agent)
     const ws = workspaceOfAgent(agent)
@@ -278,6 +311,11 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
       let priorUser = 0
       for (const e of agent.session.events) {
         if ((e as { type?: string })?.type === 'user/message') priorUser++
+      }
+      if (ws) {
+        try {
+          appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] pre-step first pid=${process.pid} sid=${shortSessionId(sid)} priorUser=${priorUser} userMsgs=${userMsgs.length}\n`)
+        } catch { /* 日志失败不阻塞 */ }
       }
       if (priorUser === 0) {
         // 会话首条消息：只注入长期记忆快照，不跑命中链路。
@@ -319,10 +357,14 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
           .filter((b: { type?: string; text?: string }) => b.type === 'text' && typeof b.text === 'string')
           .map((b: { text?: string }) => b.text ?? '')
           .join(' ')
-        const hit = buildHitInjection(getDb(ws, resolved.projectDir), ws, sid, text, {
+        const db = getDb(ws, resolved.projectDir)
+        const hit = buildHitInjection(db, ws, sid, text, {
           hitTopK: resolved.hitTopK,
           titleMax: resolved.titleMax,
         }, resolved.projectDir)
+        try {
+          appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] hit-chain pid=${process.pid} sid=${shortSessionId(sid)} text=${text.slice(0, 40).replace(/\n/g, ' ')} hit=${hit === null ? 'null' : 'yes'}\n`)
+        } catch { /* 日志失败不阻塞 */ }
         if (hit !== null) {
           const rewritten = decision.messages.map((m) => m === lastUser
             ? { ...m, content: [{ type: 'text', text: hit.text }, ...m.content] }
@@ -338,13 +380,21 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
   // 2) turn 结束：dream 轮推进 / 自动反思。
   ctx.on('agent/turn-stopping', ({ agent }) => {
     const t0 = Date.now()
-    if (agent.session.header.parentSession !== undefined) return // 子代理不参与
+    if (agent.session.header.origin === 'subagent') return // 子代理不参与（origin 权威判定）
     registerLiveAgent(agent)
     // 用户按停止（aborted/interrupted）：不反思、不推进——停止就是要停，别又开新请求
     const endReason = lastTurnEndReason(agent.session.events)
     if (endReason === 'aborted' || endReason === 'interrupted') return
-    if (wasDreamTurn(agent.session.events)) {
-      advanceDream(agent) // dream 轮：推进下一组或收尾（不反思）
+    const dreamTurn = wasDreamTurn(agent.session.events)
+    const wsTs = workspaceOfAgent(agent)
+    const sidTs = sessionIdOfAgent(agent)
+    if (wsTs) {
+      try {
+        appendFileSync(join(wsTs, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] turn-stopping pid=${process.pid} sid=${shortSessionId(sidTs)} reason=${endReason ?? 'none'} wasDream=${dreamTurn}\n`)
+      } catch { /* 日志失败不阻塞 */ }
+    }
+    if (dreamTurn) {
+      advanceDream(agent, resolved.projectDir) // dream 轮：推进下一组或收尾（含孤儿收尾）
       return
     }
     if (!resolved.reflect) return
@@ -368,14 +418,69 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
   )
 
   ctx.on('dispose', () => {
+    for (const dispose of toolDisposers) {
+      try {
+        dispose()
+      } catch {
+        /* 注销失败不阻塞 */
+      }
+    }
     stopDream()
     closeAllDbs()
   })
 }
 
-// ── 模块级窗口索引（sessionId → workspace；重启后由 session/event 重建） ────
+// ── 模块级窗口索引（sessionId → workspace） ────────────────────────────────
+// 持久化到 homedir/.dsh-meow/window-index.json：热重载/重启会重置模块级 Map，
+// 若不恢复则旧窗口（reload 后无新事件）从 dream 检查中失联——有记忆也不 dream。
+// 恢复后 agent 经 ctx.agents（AgentRegistry，harness 进程级）获取，不受插件 reload 影响。
 
 const windowIndex = new Map<string, string>()
+const WINDOW_INDEX_FILE = join(homedir(), '.dsh-meow', 'window-index.json')
+
+/** apply 时恢复窗口索引：①文件（上次落盘）→ workspace 集合；②每个已知 workspace
+ *  的 windows 表（DB 持久化，含 reload 前全部窗口）补全——旧窗口（reload 后无新
+ *  事件、文件里没有）也能恢复，不会从 dream 检查中失联。 */
+function loadWindowIndex(dir = '.dsh-meow'): void {
+  const workspaces = new Set<string>()
+  try {
+    const merged = JSON.parse(readFileSync(WINDOW_INDEX_FILE, 'utf8')) as Record<string, unknown>
+    for (const [sid, ws] of Object.entries(merged)) {
+      if (typeof ws === 'string' && ws.length > 0) {
+        windowIndex.set(sid, ws)
+        workspaces.add(ws)
+      }
+    }
+  } catch {
+    /* 无文件/损坏 */
+  }
+  for (const ws of workspaces) {
+    try {
+      for (const w of getDb(ws, dir).listWindows()) {
+        if (typeof w.workspace === 'string' && w.workspace.length > 0) windowIndex.set(w.session_id, w.workspace)
+      }
+    } catch {
+      /* 该 workspace 库不可用：跳过 */
+    }
+  }
+}
+
+/** 窗口索引落盘（读-合并-写，低频事件驱动；失败不阻塞）。 */
+function persistWindowIndex(): void {
+  try {
+    mkdirSync(dirname(WINDOW_INDEX_FILE), { recursive: true })
+    let merged: Record<string, string> = {}
+    try {
+      merged = JSON.parse(readFileSync(WINDOW_INDEX_FILE, 'utf8')) as Record<string, string>
+    } catch {
+      /* 首次写入 */
+    }
+    for (const [sid, ws] of windowIndex) merged[sid] = ws
+    writeFileSync(WINDOW_INDEX_FILE, JSON.stringify(merged), 'utf8')
+  } catch {
+    /* 持久化失败不阻塞 */
+  }
+}
 
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
@@ -384,4 +489,4 @@ export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
-export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity, hourInTimeZone } from './dream.js'
+export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity, hourInTimeZone, startWindowDream, advanceDream, recoverInterruptedDream } from './dream.js'

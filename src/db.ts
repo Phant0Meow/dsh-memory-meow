@@ -143,7 +143,12 @@ export class MemoryDb {
       session_id TEXT PRIMARY KEY,
       workspace TEXT,
       last_event_time INTEGER,
-      last_dream_time INTEGER
+      last_dream_time INTEGER,
+      dream_pending INTEGER NOT NULL DEFAULT 0
+    )`)
+    this.db.exec(`CREATE TABLE IF NOT EXISTS dream_meta (
+      key TEXT PRIMARY KEY,
+      value INTEGER
     )`)
     this.upgrade()
   }
@@ -173,6 +178,13 @@ export class MemoryDb {
         const created = (this.db.prepare(`SELECT created_at FROM ${level} WHERE id = ?`).get(id) as { created_at: number }).created_at
         this.db.prepare(`UPDATE ${level} SET id = ? WHERE id = ?`).run(newId(created), id)
       }
+    }
+    // windows 表：v0.9.0 加 dream_pending（dream 进行中标记，跨进程/重启防重复 dream）
+    const wCols = new Set(
+      (this.db.prepare('PRAGMA table_info(windows)').all() as Array<{ name: string }>).map((c) => c.name),
+    )
+    if (!wCols.has('dream_pending')) {
+      this.db.exec('ALTER TABLE windows ADD COLUMN dream_pending INTEGER NOT NULL DEFAULT 0')
     }
   }
 
@@ -369,6 +381,51 @@ export class MemoryDb {
 
   setWindowDream(sessionId: string, time: number): void {
     this.db.prepare(`UPDATE windows SET last_dream_time = ? WHERE session_id = ?`).run(time, sessionId)
+  }
+
+  /** 原子抢占 dream 任务（跨进程/实例防重复 start）：返回 true 表示抢占成功（可 start）。
+   *   UPDATE 条件写 dream_pending=0，SQLite 语句级原子——多个进程并发时只有一个成功。 */
+  claimDream(sessionId: string): boolean {
+    this.db
+      .prepare(`INSERT OR IGNORE INTO windows (session_id, workspace, last_event_time, last_dream_time, dream_pending)
+        VALUES (?, NULL, 0, NULL, 0)`)
+      .run(sessionId)
+    return (
+      this.db
+        .prepare(`UPDATE windows SET dream_pending = 1 WHERE session_id = ? AND dream_pending = 0`)
+        .run(sessionId).changes === 1
+    )
+  }
+
+  /** dream 收尾：清进行中标记 + 记 last_dream_time（dream 完成时刻）。 */
+  finishDream(sessionId: string, time: number): void {
+    this.db.prepare(`UPDATE windows SET dream_pending = 0, last_dream_time = ? WHERE session_id = ?`).run(time, sessionId)
+  }
+
+  /** 该窗口是否有未收尾的 dream（start 过但未 done：进程重启/热重载/跨进程打断）。 */
+  isDreamPending(sessionId: string): boolean {
+    const row = this.db.prepare(`SELECT dream_pending FROM windows WHERE session_id = ?`).get(sessionId) as
+      | { dream_pending: number }
+      | undefined
+    return row?.dream_pending === 1
+  }
+
+  // ── 全局检查门（dream 定时器防叠加） ─────────────────────────────────────
+  // 根因：插件热重载/多实例并存时，dispose 未必清理旧 setInterval → 多个定时器
+  // 叠加 → 检查频率远高于 checkMinutes，同一窗口被反复 start。检查动作本身
+  // 必须幂等：DB 原子抢占"检查窗口"（minIntervalMs 内只有一个实例通过），
+  // 与 startWindowDream 的 claimDream（start 幂等）+ recoverInterruptedDream
+  // （中断自愈）组成三层防重复闭环。
+
+  /** 原子抢占一次检查窗口：minIntervalMs 内只有一个调用方返回 true。 */
+  claimCheckGate(minIntervalMs: number): boolean {
+    this.db.prepare(`INSERT OR IGNORE INTO dream_meta (key, value) VALUES ('last_check', 0)`).run()
+    const now = Date.now()
+    return (
+      this.db
+        .prepare(`UPDATE dream_meta SET value = ? WHERE key = 'last_check' AND value <= ?`)
+        .run(now, now - minIntervalMs).changes === 1
+    )
   }
 
   getWindow(sessionId: string): { session_id: string; workspace: string; last_event_time: number; last_dream_time: number | null } | undefined {

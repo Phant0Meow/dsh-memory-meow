@@ -17,15 +17,69 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import type { InputZone } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { computeFoldGroups, foldLabel, type FoldGroup } from './client-fold.ts'
+import type { AssistantChatData, ChatNode, ToolChatData } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
 
 /** 折叠行标记（CSS 规则隐藏）。 */
 const FOLDED_ATTR = 'data-meow-memory-folded'
 const ANCHOR_ATTR = 'data-meow-memory-anchor'
 const BODY_ATTR = 'data-meow-memory-body'
+const INJ_ANCHOR_ATTR = 'data-meow-injection-anchor'
+const INJ_BODY_ATTR = 'data-meow-injection-body'
+const INJ_PROMPT_ATTR = 'data-meow-injection-prompt'
 
-const FOLD_CSS = `[${FOLDED_ATTR}="true"] { display: none !important; }`
+const FOLD_CSS = `[${FOLDED_ATTR}="true"] { display: none !important; }
+[data-meow-detail-body] {
+  display: none;
+  margin: 2px 0 8px 22px;
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dsw-alias-label-secondary, rgba(190,190,190,.9));
+  background: rgba(127,127,127,.06);
+  border: 1px solid rgba(127,127,127,.12);
+  border-radius: 8px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace;
+}
+[data-meow-detail-body="think"] {
+  font-family: inherit;
+  font-style: italic;
+  opacity: .9;
+}
+[${INJ_BODY_ATTR}] {
+  display: none;
+  margin: 2px 0 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dsw-alias-label-secondary, rgba(190,190,190,.9));
+  background: rgba(127,127,127,.05);
+  border: 1px solid rgba(127,127,127,.12);
+  border-radius: 8px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, 'Courier New', monospace;
+}
+[${INJ_PROMPT_ATTR}] {
+  display: flex;
+  justify-content: flex-end;
+  margin: 2px 0 6px;
+}
+[${INJ_PROMPT_ATTR}] > div {
+  max-width: 82%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--dsw-alias-bubble-user-bg, rgba(127,127,127,.12));
+  color: var(--dsw-alias-label-primary, inherit);
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}`
 
 /** 卡片克隆签名缓存（groupId → 原始行文本签名）：展开时行内容更新/不完整则自愈重克隆。 */
 const bodySigs = new Map<string, string>()
@@ -97,8 +151,70 @@ function ensureAnchor(
   }
 }
 
+/**
+ * 给克隆的静态行补上折叠块（Think / tool call）的展开能力。
+ * 背景：dsh UI 的 DisclosureRow 展开内容（think 全文 / tool 详情）是 React 条件渲染
+ * （open && children），折叠时不在 DOM 里——纯 DOM 克隆会永久丢失，且 React 事件
+ * 不复制导致"点不开"。这里用快照数据把详情补进克隆 DOM，并用原生 click 切换
+ * data-open + 显示/隐藏（幂等：每行只增强一次，fillBody 每次重建克隆）。
+ */
+function attachDisclosure(rowEl: HTMLElement, label: string, text: string): void {
+  const root = rowEl.parentElement
+  if (root === null) return
+  if (root.querySelector(':scope > [data-meow-detail-body]') !== null) return // 已增强
+  const body = document.createElement('div')
+  body.setAttribute('data-meow-detail-body', label)
+  body.textContent = text
+  body.style.display = 'none'
+  root.appendChild(body)
+  rowEl.addEventListener('click', () => {
+    const open = root.getAttribute('data-open') === 'true'
+    root.setAttribute('data-open', open ? '' : 'true')
+    body.style.display = open ? 'none' : 'block'
+  })
+}
+
+/** 增强一个克隆行：按快照数据补 Think/tool/context 详情（同类块按 DOM 顺序匹配源顺序）。 */
+function enhanceClone(clone: HTMLElement, node: ChatNode | undefined): void {
+  if (node === undefined) return
+  // 注意：assistant 节点在 ChatNodeDataMap 注册的 kind 是 'assistant-step'（dsh 源码
+  // conversation-nodes/assistant.ts），不是 'assistant'——写错则 think 增强永不生效。
+  if (node.kind === 'assistant-step') {
+    const blocks = (node.data as AssistantChatData).blocks
+    const reasoning = blocks.filter((b): b is Extract<typeof b, { kind: 'reasoning' }> => b.kind === 'reasoning')
+    const toolCalls = blocks.filter((b): b is Extract<typeof b, { kind: 'tool-call' }> => b.kind === 'tool-call')
+    const thinkRows = Array.from(clone.querySelectorAll<HTMLElement>('[data-variant="think"]'))
+    thinkRows.forEach((root, i) => {
+      const text = reasoning[i]?.text
+      const rowEl = root.querySelector<HTMLElement>('[data-disclosure-row]')
+      if (text !== undefined && rowEl !== null) attachDisclosure(rowEl, 'think', text)
+    })
+    const toolRows = Array.from(clone.querySelectorAll<HTMLElement>('[data-disclosure-row]'))
+      .filter((el) => el.closest('[data-variant="think"]') === null)
+    toolRows.forEach((rowEl, i) => {
+      const block = toolCalls[i]
+      if (block !== undefined) attachDisclosure(rowEl, 'tool', toolCallDetail(block))
+    })
+  } else if (node.kind === 'tool-call') {
+    const root = (node.data as ToolChatData).root
+    const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
+    if (rowEl === null) return
+    const name = 'name' in root ? root.name : (root.call?.name ?? root.callId)
+    const argsRaw = 'name' in root ? root.argsRaw : (root.call?.argsRaw ?? '')
+    const detail = toolCallDetail({ name, argsRaw })
+    const resultText = 'content' in root ? blocksToText(root.content) : ''
+    attachDisclosure(rowEl, 'tool', resultText.length > 0 ? `${detail}\n\n【结果】\n${resultText}` : detail)
+  } else if (node.kind === 'context') {
+    // 上下文注入行（反思/dream 指令 prompt）：补完整文本可展开查看。
+    const content = (node.data as { content?: readonly { type?: string; text?: string }[] }).content
+    const text = blocksToText(content ?? [])
+    const rowEl = clone.querySelector<HTMLElement>('[data-disclosure-row]')
+    if (rowEl !== null && text.length > 0) attachDisclosure(rowEl, 'context', text)
+  }
+}
+
 /** 填充/清空一个组的展开卡片（克隆原始行，静态快照；签名记录供自愈比对）。 */
-function fillBody(id: string, visible: boolean, keys: readonly string[]): void {
+function fillBody(id: string, visible: boolean, keys: readonly string[], session: ConversationSnapshot): void {
   for (const container of Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))) {
     const anchor = anchorOf(container, id)
     if (anchor === null) continue
@@ -121,8 +237,79 @@ function fillBody(id: string, visible: boolean, keys: readonly string[]): void {
       clone.removeAttribute('data-chat-anchor-key')
       clone.removeAttribute('data-chat-flow-kind')
       body.appendChild(clone)
+      enhanceClone(clone, session.chat.nodes.get(key))
     }
     bodySigs.set(id, sigOf(container, keys))
+  }
+}
+
+/** 应用一次注入折叠（首轮长期记忆/关键词命中）：原行隐藏，原位插入
+ *  「已注入记忆」横条（点开显示注入全文）+ 用户 prompt 气泡。
+ *  幂等：只做元素存在性/文本写入；克隆行不重建（内容由快照确定，不变）。 */
+function applyInjectionFold(
+  groups: readonly InjectionGroup[],
+  expanded: ReadonlySet<string>,
+  onToggle: (id: string) => void,
+): void {
+  const containers = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))
+  if (containers.length === 0) return
+  const liveIds = new Set(groups.map((g) => g.id))
+  for (const container of containers) {
+    for (const stale of Array.from(container.querySelectorAll<HTMLElement>(`[${INJ_ANCHOR_ATTR}]`))) {
+      if (!liveIds.has(stale.getAttribute(INJ_ANCHOR_ATTR) ?? '')) stale.remove()
+    }
+    for (const group of groups) {
+      const startRow = flowRow(container, group.id)
+      if (startRow === null || startRow.parentElement === null) continue
+      startRow.setAttribute(FOLDED_ATTR, 'true') // 原行隐藏
+      let anchor = container.querySelector<HTMLElement>(`[${INJ_ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)
+      if (anchor === null) {
+        anchor = document.createElement('div')
+        anchor.setAttribute(INJ_ANCHOR_ATTR, group.id)
+        startRow.parentElement.insertBefore(anchor, startRow)
+      }
+      let bar = anchor.querySelector<HTMLButtonElement>(':scope > button')
+      if (bar === null) {
+        bar = document.createElement('button')
+        bar.type = 'button'
+        // 右对齐 + 与用户气泡同宽（max-width 82%）——横条视觉归属用户消息。
+        bar.style.cssText = [
+          'display:block;margin:4px 0 4px auto;max-width:82%;padding:5px 12px;',
+          'font-size:12px;line-height:1.6;text-align:left;cursor:pointer;',
+          'color:var(--dsw-text-secondary, rgba(127,127,127,.9));',
+          'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.14);',
+          'border-radius:999px;',
+        ].join('')
+        bar.addEventListener('click', () => onToggle(group.id))
+        anchor.appendChild(bar)
+      }
+      const kindLabel = group.kind === 'first' ? '（长期记忆）' : '（关键词命中）'
+      const label = `${expanded.has(group.id) ? '▾' : '▸'} 已注入记忆${kindLabel}`
+      if (bar.textContent !== label) bar.textContent = label
+      let body = anchor.querySelector<HTMLElement>(`:scope > [${INJ_BODY_ATTR}]`)
+      if (body === null) {
+        body = document.createElement('div')
+        body.setAttribute(INJ_BODY_ATTR, 'true')
+        anchor.appendChild(body)
+      }
+      if (expanded.has(group.id)) {
+        if (body.textContent !== group.injectedText) body.textContent = group.injectedText
+        body.style.display = 'block'
+      } else {
+        body.style.display = 'none'
+      }
+      // 用户 prompt 气泡（纯文本；带附件的消息不折叠——computeInjectionGroups 已过滤）
+      let prompt = anchor.querySelector<HTMLElement>(`:scope > [${INJ_PROMPT_ATTR}]`)
+      if (prompt === null) {
+        prompt = document.createElement('div')
+        prompt.setAttribute(INJ_PROMPT_ATTR, 'true')
+        const bubble = document.createElement('div')
+        prompt.appendChild(bubble)
+        anchor.appendChild(prompt)
+      }
+      const bubble = prompt.firstElementChild as HTMLElement | null
+      if (bubble !== null && bubble.textContent !== group.userText) bubble.textContent = group.userText
+    }
   }
 }
 
@@ -133,6 +320,7 @@ function applyFoldState(
   groups: readonly FoldGroup[],
   expanded: ReadonlySet<string>,
   onToggle: (id: string) => void,
+  session: ConversationSnapshot,
 ): void {
   const containers = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-flow]'))
   if (containers.length === 0) return
@@ -153,7 +341,7 @@ function applyFoldState(
       if (expanded.has(group.id)) {
         // 自愈：克隆快照落后于原始行（点击时行未完整/之后被更新）→ 重克隆收敛。
         const sig = sigOf(container, group.keys)
-        if (bodySigs.get(group.id) !== sig) fillBody(group.id, true, group.keys)
+        if (bodySigs.get(group.id) !== sig) fillBody(group.id, true, group.keys, session)
       } else {
         bodySigs.delete(group.id)
       }
@@ -166,7 +354,9 @@ function applyFoldState(
  */
 export function MemoryFoldDock({ session }: InputZone): null {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  const [injExpanded, setInjExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const groups = useMemo(() => computeFoldGroups(session), [session])
+  const injGroups = useMemo(() => computeInjectionGroups(session), [session])
   const toggle = useCallback((id: string): void => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -175,25 +365,35 @@ export function MemoryFoldDock({ session }: InputZone): null {
       else next.delete(id)
       // 同步填充/清空展开卡片（不依赖 effect 时序，也避免 observer 循环）。
       const group = groups.find((candidate) => candidate.id === id)
-      fillBody(id, willExpand, group?.keys ?? [])
+      fillBody(id, willExpand, group?.keys ?? [], session)
       return next
     })
-  }, [groups])
+  }, [groups, session])
+  const toggleInj = useCallback((id: string): void => {
+    setInjExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
 
   // 快照/展开态变化 → 重放折叠（行隐藏 + 锚点，不改卡片内容）。
   useLayoutEffect(() => {
-    applyFoldState(groups, expanded, toggle)
-  }, [groups, expanded, toggle])
+    applyFoldState(groups, expanded, toggle, session)
+    applyInjectionFold(injGroups, injExpanded, toggleInj)
+  }, [groups, expanded, toggle, session, injGroups, injExpanded, toggleInj])
 
   // 兜底：视图切换/元素重建/流式重渲染导致 DOM 变化时自愈（防抖）。
-  const latest = useRef({ groups, expanded, toggle })
-  latest.current = { groups, expanded, toggle }
+  const latest = useRef({ groups, expanded, toggle, session, injGroups, injExpanded, toggleInj })
+  latest.current = { groups, expanded, toggle, session, injGroups, injExpanded, toggleInj }
   useEffect(() => {
     let timer = 0
     const observer = new MutationObserver(() => {
       window.clearTimeout(timer)
       timer = window.setTimeout(() => {
-        applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle)
+        applyFoldState(latest.current.groups, latest.current.expanded, latest.current.toggle, latest.current.session)
+        applyInjectionFold(latest.current.injGroups, latest.current.injExpanded, latest.current.toggleInj)
       }, 80)
     })
     observer.observe(document.body, { childList: true, subtree: true })

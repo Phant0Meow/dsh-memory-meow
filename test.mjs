@@ -12,6 +12,7 @@ import {
   MEMORY_GUIDE,
   MemoryDb,
   memoryDbPath,
+  getDb,
   closeAllDbs,
   migrateLegacy,
   buildInjection,
@@ -21,6 +22,9 @@ import {
   groupWindowMemories,
   buildDreamMessage,
   windowNeedsDream,
+  startWindowDream,
+  advanceDream,
+  recoverInterruptedDream,
   findSimilar,
   markSearched,
   readSeen,
@@ -112,6 +116,24 @@ check('window needs dream (new chat after dream)', windowNeedsDream({ last_event
 check('window no dream (dream after chat)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: Date.now() + 1000 }) === false)
 check('window no dream (older than 24h)', windowNeedsDream({ last_event_time: Date.now() - 25 * 3600_000, last_dream_time: null }) === false)
 
+// dream 抢占与收尾（防重复 dream：跨进程/重启后状态一致）
+check('claimDream succeeds first', dbW.claimDream('win-1') === true)
+check('claimDream second fails (pending)', dbW.claimDream('win-1') === false)
+check('isDreamPending true', dbW.isDreamPending('win-1') === true)
+dbW.finishDream('win-1', 3000)
+check('finishDream clears pending', dbW.isDreamPending('win-1') === false)
+check('finishDream sets last_dream_time', dbW.getWindow('win-1')?.last_dream_time === 3000)
+check('claimDream succeeds after finish', dbW.claimDream('win-1') === true)
+check('claim on missing window creates row', dbW.claimDream('win-missing') === true &&
+  dbW.getWindow('win-missing')?.dream_pending === 1)
+dbW.finishDream('win-missing', 0)
+dbW.finishDream('win-1', 0)
+
+// 全局检查门：minIntervalMs 内只有一个调用方通过（防多实例/多定时器叠加重复检查）
+check('check gate passes first', dbW.claimCheckGate(0) === true)
+check('check gate blocks within interval', dbW.claimCheckGate(86_400_000) === false)
+check('check gate passes after interval', dbW.claimCheckGate(0) === true)
+
 // dream 分组排序
 const wsD = mkdtempSync(join(tmpdir(), 'mm-dream-'))
 const dbD = new MemoryDb(memoryDbPath(wsD))
@@ -140,6 +162,41 @@ check('dream message T label', dtxt.includes('1970-01-01 00:00'))
 check('dream message rules', dtxt.includes('原话') && dtxt.includes('importance') && dtxt.includes('find_similar') && dtxt.includes('本组整理完成'))
 check('dream rules require project param', dtxt.includes('project 参数'))
 dbD.close()
+
+// startWindowDream 抢占 + advanceDream 收尾 + 补收尾（防重复 dream 链路）
+const wsClaim = mkdtempSync(join(tmpdir(), 'mm-claim-'))
+const dbClaim = new MemoryDb(memoryDbPath(wsClaim))
+dbClaim.touchWindow('win-claim', wsClaim, Date.now())
+const agentClaim = { session: { header: { id: 'win-claim' } }, steer: () => {} }
+check('startWindowDream: no memories → false', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
+dbClaim.insert({ level: 'fact', content: '待整理的记忆', source_session: 'win-claim' })
+check('startWindowDream: ok', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
+check('startWindowDream: second rejected while running', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
+check('pending flag set while running', dbClaim.isDreamPending('win-claim') === true)
+advanceDream(agentClaim) // 收尾（1 组）
+check('advanceDream finishes → pending cleared', dbClaim.isDreamPending('win-claim') === false)
+check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
+check('startWindowDream: ok again after finish', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
+// 模拟中断：start 后不 advance（如同进程崩溃/重载），补收尾恢复
+dbClaim.finishDream('win-claim', 0) // 先清掉上面 start 的标记，模拟"标记残留"
+check('recoverInterruptedDream clears pending', (() => {
+  dbClaim.touchWindow('win-claim', wsClaim, Date.now())
+  const n = recoverInterruptedDream(dbClaim, 'win-claim', wsClaim, '.dsh-meow')
+  return dbClaim.isDreamPending('win-claim') === false && dbClaim.getWindow('win-claim')?.last_dream_time !== null && n >= 0
+})())
+dbClaim.close()
+
+// 孤儿收尾（根因修复 2026-08-16）：turn 结束的窗口不是本实例 currentDream
+// （残留 fiber 跨实例 start）→ advanceDream 无条件补收尾，断反复 dream 永动机
+const wsOrphan = mkdtempSync(join(tmpdir(), 'mm-orphan-'))
+const dbOrphan = new MemoryDb(memoryDbPath(wsOrphan))
+dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
+dbOrphan.insert({ level: 'fact', content: '孤儿窗口的记忆', source_session: 'win-orphan' })
+dbOrphan.claimDream('win-orphan') // 模拟残留 fiber start 写了 pending
+advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow')
+check('orphan dream recovered by advanceDream', dbOrphan.isDreamPending('win-orphan') === false &&
+  dbOrphan.getWindow('win-orphan')?.last_dream_time !== null)
+dbOrphan.close()
 
 // ── recall 增强：find_similar / seen 排除 ───────────────────────────────────
 const wsR = mkdtempSync(join(tmpdir(), 'mm-recall-'))
@@ -225,7 +282,7 @@ if (inj) {
   check('injection blocks', inj.text.includes('===== 长期记忆 =====') && inj.text.includes('【关于user】') &&
     inj.text.includes('【记忆导引】'))
   check('injection first line flush-left', inj.text.startsWith('===== 长期记忆 ====='))
-  check('injection guide three lines', inj.text.includes('需要时用 memory_search 检索、memory_read 读取。') &&
+  check('injection guide three lines', inj.text.includes('需要时用 memory_search 检索（必须传 query 检索词，不能空查）、memory_read 读取。') &&
     inj.text.includes('当有项目相关任务时，应先用 memory_project 查项目全景，这样可以对项目有整体理解。') &&
     inj.text.includes('用户的所有 project：'))
   check('injection no topic/project title list', !inj.text.includes('- topic:') && !inj.text.includes('- project:'))
@@ -321,6 +378,22 @@ const searchCtx2 = { agent: { session: { header: { cwd: wsSeen, id: 's-comp' } }
 const reHit = await searchTool.execute({ query: '重新命中', project: 'dsh' }, searchCtx2)
 check('search re-hits after compaction', reHit.hits.some((h) => h.content.includes('压缩后应能重新命中')))
 dbSeen.close()
+
+// 插件注入轮（反思/dream steer 消息轮）内的事件不刷新窗口活跃度（防 dream 反复触发）
+const wsWin = mkdtempSync(join(tmpdir(), 'mm-win-'))
+const evtHandler = handlers['session/event']
+const sessWin = { id: 's-win', header: { cwd: wsWin } }
+const tPlugin = Date.now()
+await evtHandler(sessWin, { type: 'turn/start', time: tPlugin })
+await evtHandler(sessWin, { type: 'user/message', time: tPlugin + 1, data: { source: { kind: 'plugin', plugin: 'meow-memory' }, content: [{ type: 'text', text: '[meow-memory-dream] x' }] } })
+await evtHandler(sessWin, { type: 'assistant/message', time: tPlugin + 2, data: { message: { content: [{ type: 'text', text: 'ok' }] } } })
+await evtHandler(sessWin, { type: 'turn/end', time: tPlugin + 3, data: { reason: { kind: 'completed' } } })
+check('plugin turn does not touch window', getDb(wsWin, '.dsh-meow').getWindow('s-win') === undefined)
+// 用户消息正常刷新活跃度（新 turn 重置标记后）
+const tUser = Date.now() + 10_000
+await evtHandler(sessWin, { type: 'turn/start', time: tUser })
+await evtHandler(sessWin, { type: 'user/message', time: tUser + 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } })
+check('user message touches window', getDb(wsWin, '.dsh-meow').getWindow('s-win')?.last_event_time === tUser + 1)
 
 // memory_project：项目完整注入段落（用户拍板规格：全量/分组/排序/已完成 5 条）
 const projectTool = tools.find((t) => t.name === 'memory_project')
@@ -520,13 +593,24 @@ const decisionB = await preStep(
 )
 check('no injection with history', decisionB.messages[0].content.length === 1)
 
-// 子代理（有 parentSession）→ 不注入
-const agentC = { session: { header: { cwd: ws, id: 's3', parentSession: 'x' }, events: [] }, steer: () => {} }
+// 子代理（origin === 'subagent'，dsh 权威标记）→ 不注入
+const agentC = { session: { header: { cwd: ws, id: 's3', parentSession: 'x', origin: 'subagent' }, events: [] }, steer: () => {} }
 const decisionC = await preStep(
   { agent: agentC, messages: [{ content: [{ type: 'text', text: '嗨' }], source: { kind: 'user' } }], turn: 1, step: 1, signal: new AbortController().signal },
   async () => ({ kind: 'enter', messages: [{ content: [{ type: 'text', text: '嗨' }], source: { kind: 'user' } }] }),
 )
 check('no injection for subagent', decisionC.messages[0].content.length === 1)
+
+// 回归（真机 2026-08-17）：GUI fork/续写的主会话有 parentSession 但无 origin——不是子代理，必须注入
+const agentFork = { session: { header: { cwd: ws, id: 's-fork', parentSession: 's-parent' }, events: [] }, steer: () => {} }
+const forkMsg = { content: [{ type: 'text', text: 'fork 会话的首条消息' }], source: { kind: 'user' } }
+const decisionFork = await preStep(
+  { agent: agentFork, messages: [forkMsg], turn: 1, step: 1, signal: new AbortController().signal },
+  async () => ({ kind: 'enter', messages: [forkMsg] }),
+)
+check('fork session (parentSession without origin) still injects', decisionFork.kind === 'enter' &&
+  decisionFork.messages[0].content.length === 2 &&
+  decisionFork.messages[0].content[0].text.includes('===== 长期记忆 ====='))
 
 // turn-stopping 反思（单任务内连续工具 step ≥7 才触发——用户拍板语义）
 const stopping = handlers['agent/turn-stopping']

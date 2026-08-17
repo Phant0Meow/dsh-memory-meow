@@ -173,7 +173,7 @@ export function buildInjection(
   const projectNames = db.listProjectNames()
   if (projectNames.length > 0) {
     lines.push('【记忆导引】')
-    lines.push('需要时用 memory_search 检索、memory_read 读取。')
+    lines.push('需要时用 memory_search 检索（必须传 query 检索词，不能空查）、memory_read 读取。')
     lines.push('当有项目相关任务时，应先用 memory_project 查项目全景，这样可以对项目有整体理解。')
     lines.push(`用户的所有 project：${projectNames.join(' / ')}`)
     lines.push('')

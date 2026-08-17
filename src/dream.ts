@@ -154,7 +154,9 @@ export function windowNeedsDream(w: { last_event_time: number; last_dream_time: 
 
 /**
  * 启动一个窗口的 dream（steer 第一组）。agent 必须是该窗口的 live 顶层 agent。
- * 返回 false 表示无法启动（已有任务在跑 / 无记忆可整理）。
+ * 返回 false 表示无法启动（已有任务在跑 / 别处（含其他进程）正在 dream / 无记忆可整理）。
+ * 防重复：DB 原子抢占 dream_pending 标记（跨进程/重启一致）——抢占失败即不 start；
+ * 抢占成功后即使本进程崩溃/被重载，下个检查周期也会补收尾而不是重复 start。
  */
 export function startWindowDream(ctx: Context, agent: { session?: { header?: { id?: string } } }, workspace: string, dir = '.dsh-meow'): boolean {
   if (currentDream !== null) return false
@@ -163,42 +165,70 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   const db = getDb(workspace, dir)
   const groups = groupWindowMemories(db, sessionId)
   if (groups.length === 0) return false
+  if (!db.claimDream(sessionId)) return false // 别处（其他进程/实例）已在 dream
   const win = db.getWindow(sessionId)
   const T = win?.last_event_time ?? Date.now()
   currentDream = { sessionId, workspace, dir, T, groups, idx: 0 }
   const msg = buildDreamMessage(db, sessionId, T, groups, 0)
   ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-  dreamLog(workspace, dir, `dream start session=${shortSessionId(sessionId)} groups=${groups.length} T=${T}`)
+  dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} groups=${groups.length} T=${T}`)
   return true
 }
 
-/** turn-stopping 推进：本 turn 是 dream 轮 → 下一组或收尾。 */
-export function advanceDream(agent: unknown): void {
-  const task = currentDream
-  if (!task) return
+/**
+ * turn-stopping 推进：本 turn 是 dream 轮 → 下一组或收尾。
+ * 孤儿收尾（根因修复 2026-08-16）：热重载残留的旧 fiber（dispose 未清理）仍会
+ * start dream 且不写 pending，而 turn-stopping 只被新 fiber 收到 → currentDream
+ * 不匹配 → 收尾被吞 → last_dream_time 永不落库 → 窗口永久 need=true → 反复 start。
+ * 因此：currentDream 不匹配（null 或别的窗口）时无条件补收尾——窗口 need=false
+ * 后残留 fiber 也无窗口可 dream，永动机断掉。重复收尾无害（stampDream MAX 幂等、
+ * finishDream 幂等；多组被提前收尾时后续更新 updated_at 晚于 T 不被覆盖）。
+ */
+export function advanceDream(agent: unknown, dir = '.dsh-meow'): void {
   const sessionId = (agent as { session?: { header?: { id?: string } } })?.session?.header?.id
-  if (!sessionId || sessionId !== task.sessionId) return
-  const db = getDb(task.workspace, task.dir)
+  const task = currentDream
+  if (task !== null && typeof sessionId === 'string' && sessionId === task.sessionId) {
+    const db = getDb(task.workspace, task.dir)
 
-  task.idx += 1
-  if (task.idx < task.groups.length) {
-    const msg = buildDreamMessage(db, task.sessionId, task.T, task.groups, task.idx)
-    ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-    dreamLog(task.workspace, task.dir, `dream group ${task.idx + 1}/${task.groups.length} steered`)
+    task.idx += 1
+    if (task.idx < task.groups.length) {
+      const msg = buildDreamMessage(db, task.sessionId, task.T, task.groups, task.idx)
+      ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
+      dreamLog(task.workspace, task.dir, `dream group ${task.idx + 1}/${task.groups.length} steered`)
+      return
+    }
+
+    // 收尾：全部条目 updated_at = T（封存语义不变）；窗口 last_dream_time = dream 完成时刻
+    // （不是 T！dream 轮本身会产生会话事件推后 last_event_time，若记 T 则
+    // last_dream_time < last_event_time 永远成立 → 窗口永远"需要 dream" 无限重复）。
+    // try/finally：收尾异常也不能卡住 currentDream（否则后续 start 全被拒）。
+    try {
+      const stamped = db.stampDream(task.sessionId, task.T)
+      db.finishDream(task.sessionId, Date.now())
+      db.logDream(
+        `window dream done: ${shortSessionId(task.sessionId)} groups=${task.groups.length} stamped=${stamped} T=${new Date(task.T).toISOString()}`,
+        { before: undefined, after: undefined },
+      )
+      dreamLog(task.workspace, task.dir, `dream done session=${shortSessionId(task.sessionId)} groups=${task.groups.length} stamped=${stamped}`)
+    } catch (e) {
+      dreamLog(task.workspace, task.dir, `dream finish error: ${String(e)}`)
+    } finally {
+      currentDream = null
+    }
     return
   }
 
-  // 收尾：全部条目 updated_at = T（封存语义不变）；窗口 last_dream_time = dream 完成时刻
-  // （不是 T！dream 轮本身会产生会话事件推后 last_event_time，若记 T 则
-  // last_dream_time < last_event_time 永远成立 → 窗口永远"需要 dream" 无限重复）。
-  const stamped = db.stampDream(task.sessionId, task.T)
-  db.setWindowDream(task.sessionId, Date.now())
-  db.logDream(
-    `window dream done: ${shortSessionId(task.sessionId)} groups=${task.groups.length} stamped=${stamped} T=${new Date(task.T).toISOString()}`,
-    { before: undefined, after: undefined },
-  )
-  dreamLog(task.workspace, task.dir, `dream done session=${shortSessionId(task.sessionId)} groups=${task.groups.length} stamped=${stamped}`)
-  currentDream = null
+  // 孤儿收尾：dream 轮结束但本实例没有对应任务（残留 fiber 跨实例 start）。
+  const ws = (agent as { session?: { header?: { cwd?: string } } })?.session?.header?.cwd
+  if (typeof sessionId === 'string' && typeof ws === 'string' && ws.length > 0) {
+    const db = getDb(ws, dir)
+    recoverInterruptedDream(db, sessionId, ws, dir)
+    dreamLog(
+      ws,
+      dir,
+      `advanceDream orphan-recover sid=${shortSessionId(sessionId)} task=${task === null ? 'none' : shortSessionId(task.sessionId)}`,
+    )
+  }
 }
 
 // ── 工具：memory_dream（手动触发本窗口 dream） ─────────────────────────────
@@ -232,12 +262,38 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow'): ToolDefinition {
       if (!workspace) throw new Error('memory_dream: 无法确定工作区（会话无 cwd）')
       if (!exec.agent) throw new Error('memory_dream: 无法确定当前 agent')
       const ok = startWindowDream(ctx, exec.agent, workspace, dir)
-      return { ok, note: ok ? '整理指令已发出，逐个项目组处理中。' : currentDream !== null ? '已有 dream 任务在进行中。' : '本窗口没有需要整理的记忆。' }
+      if (ok) return { ok, note: '整理指令已发出，逐个项目组处理中。' }
+      const sessionId = exec.agent.session?.header?.id
+      const pending = typeof sessionId === 'string' && getDb(workspace, dir).isDreamPending(sessionId)
+      return {
+        ok,
+        note: currentDream !== null
+          ? '已有 dream 任务在进行中。'
+          : pending
+            ? '本窗口已有未完成的 dream（可能被打断），将自动补收尾，不重复整理。'
+            : '本窗口没有需要整理的记忆。',
+      }
     },
     presentCall(): { card: 'generic'; title: string; kind: 'write' } {
       return { card: 'generic', title: 'memory_dream: 整理本窗口记忆', kind: 'write' }
     },
   }
+}
+
+/** 补收尾被打断的 dream（start 过但没 done：进程重启/热重载/跨进程打断）。
+ *  视为已完成：封存该窗口条目 + 清 pending + 记 last_dream_time——不再重复 start。
+ *  @returns 封存（stamped）的条目数。 */
+export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId: string, workspace: string, dir = '.dsh-meow'): number {
+  const w = db.getWindow(sessionId)
+  const T = w?.last_event_time ?? Date.now()
+  const stamped = db.stampDream(sessionId, T)
+  db.finishDream(sessionId, Date.now())
+  db.logDream(
+    `window dream recovered (interrupted): ${shortSessionId(sessionId)} stamped=${stamped} T=${new Date(T).toISOString()}`,
+    { before: undefined, after: undefined },
+  )
+  dreamLog(workspace, dir, `dream recovered session=${shortSessionId(sessionId)} stamped=${stamped}`)
+  return stamped
 }
 
 // ── 定时器 ──────────────────────────────────────────────────────────────────
@@ -277,6 +333,16 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
     const hour = hourInTimeZone(cfg.timeZone)
     if (hour < cfg.windowStart || hour >= cfg.windowEnd) return
     if (Date.now() - lastActivity() < cfg.idleMinutes * 60_000) return
+    // 全局检查门（防多实例/多定时器叠加）：60 秒内只有一个实例真正执行检查。
+    // 根因：热重载/多 fiber 并存时 dispose 未必清理旧 setInterval → 检查频率
+    // 远高于 checkMinutes → 同一窗口被反复 start。用共享库的原子抢占做节流，
+    // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
+    let gatePassed = false
+    for (const [, ws] of windowIndex) {
+      if (getDb(ws, dir).claimCheckGate(60_000)) gatePassed = true
+      break
+    }
+    if (!gatePassed) return
     // 已归档会话集合（registry 全局归档；服务不可用时跳过检查）
     const archived = new Set<string>()
     try {
@@ -292,6 +358,13 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
       const db = getDb(workspace, dir)
       const w = db.getWindow(sessionId)
       if (!w || !windowNeedsDream(w)) continue
+      dreamLog(workspace, dir, `check sid=${shortSessionId(sessionId)} pending=${db.isDreamPending(sessionId)} idle=${Math.round((Date.now() - w.last_event_time) / 1000)}s`)
+      // 未收尾的 dream（start 过但没 done：进程重启/热重载/跨进程打断）：
+      // 补收尾（视为已完成，不再重复 start），防止"已 dream 过的窗口反复 dream"。
+      if (db.isDreamPending(sessionId)) {
+        recoverInterruptedDream(db, sessionId, workspace, dir)
+        continue
+      }
       // 窗口级 idle（用户拍板：session 最近 idleMinutes 无动作才 dream）：
       // 用 db 持久化的 last_event_time 判定——不受模块实例/热重载影响
       // （内存全局 lastActivity 只作快速路径，见上方 gate）。
@@ -299,7 +372,10 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
       const agent =
         liveAgents.get(sessionId) ??
         (typeof ctx.agents?.get === 'function' ? ctx.agents.get(sessionId) : undefined)
-      if (!agent) continue // 进程内无该窗口 agent（重启后）：跳过
+      if (!agent) {
+        dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)}`)
+        continue // 进程内无该窗口 agent（重启后）：跳过
+      }
       const started = startWindowDream(ctx, agent as never, workspace, dir)
       if (started) return // 一轮一个窗口
     }

@@ -68,9 +68,18 @@ last conversation timestamp.
   model whether anything since the last consolidation is worth remembering. A turn whose
   last tool is a `memory_*` tool counts as already having consolidated (no re-reflection);
   cancelled turns never trigger it.
+- **Injection-fold UI (client)**: first-turn long-term memory / per-message keyword hits
+  collapse into a slim "injected memory" bar (same width as the user bubble) — click to see
+  the full injected text; the user prompt shows as a bubble, keeping the flow clean.
+  Only plain-text messages are folded (attachment-bearing ones stay untouched).
 - **Reflection-fold UI (client)**: reflection/dream turns (prompt, think, tool calls and
-  the report) collapse into a slim bar (collapsed by default, showing "N memories added");
-  clicking expands it into a card with the full record — the message flow stays clean.
+  the report) collapse into a slim bar (collapsed by default, showing "N memories added" /
+  "dream task"); clicking expands it into a card — Think / tool calls / context injections
+  inside the card are expandable for details.
+- **Dream anti-repeat**: DB-atomic 60s check gate + atomic start claim (`dream_pending`) +
+  interrupted-dream auto-recovery + orphan finalization (a finished dream turn always lands
+  `last_dream_time`, even across hot-reload instances); plugin-turn events don't refresh
+  window activity — an already-dreamed window is never re-dreamed.
 - **Zero runtime dependencies**: `node:sqlite` (built into Node ≥22.5) + self-contained esbuild
   bundle (`lib/index.js`). No native modules.
 
@@ -83,12 +92,11 @@ last conversation timestamp.
 cd $DSH_HOME/profiles/web          # default home: ~/.dsh/profiles/web
 npm install meow-memory
 
-# 2. Register in the profile's cordis.patch.yml:
-#    - insert:
-#        - id: meow-memory
-#          name: 'meow-memory'
-#          config:
-#            enabled: true
+# 2. Add the package to the profile's assembly bundles in package.json (recommended since v0.9.0):
+#    "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "meow-memory"] } }
+#    (the package ships a dsh.bundle.patch; bundle assembly inserts it. Profile-patch
+#     `insert` entries address existing ids — a new plugin not in the tree reports
+#     "entry not found", so new plugins go through the bundles array.)
 
 # 3. Restart dsh web. New sessions pick up the plugin automatically.
 ```
@@ -101,7 +109,7 @@ npm install meow-memory
    ln -s /path/to/meow-memory ~/.dsh/profiles/web/node_modules/meow-memory
    ```
    (On Windows: `New-Item -ItemType Junction ...` — NTFS junction, no admin needed.)
-2. Register in the profile's `cordis.patch.yml` (same insert block as above).
+2. Add `meow-memory` to the profile `package.json`'s `dsh.profile.bundles` (same as above).
 3. Restart `dsh web`. New sessions pick up the plugin automatically.
 
 ## ⚙️ Configuration

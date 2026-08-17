@@ -15,7 +15,7 @@ const { outputFiles } = await build({
 })
 const code = new TextDecoder().decode(outputFiles[0].contents)
 const modUrl = 'data:text/javascript;base64,' + Buffer.from(code).toString('base64')
-const { computeFoldGroups, foldLabel } = await import(modUrl)
+const { computeFoldGroups, foldLabel, toolCallDetail, blocksToText, computeInjectionGroups } = await import(modUrl)
 
 // ---- mock 快照 ----
 function turnLoc(turn) {
@@ -30,8 +30,8 @@ function contextNode(key, text, loc) {
     data: { source: { kind: 'plugin', plugin: 'meow-memory' }, content: [{ type: 'text', text }] },
   }
 }
-function userNode(key, loc) {
-  return { key, kind: 'user', location: loc, data: { source: { kind: 'user' } } }
+function userNode(key, loc, content) {
+  return { key, kind: 'user', location: loc, data: { source: { kind: 'user' }, ...(content ? { content } : {}) } }
 }
 function steeringNode(key, loc) {
   return { key, kind: 'steering', location: loc, data: {} }
@@ -163,7 +163,7 @@ console.log('=== 6. foldLabel 文案 ===')
   check('无需记忆', foldLabel(base, false) === '▸ 记忆反思 · 无需记忆')
   check('running', foldLabel({ ...base, status: 'running' }, false) === '▸ 记忆反思进行中…')
   check('已更新 2 条', foldLabel({ ...base, updateCount: 2 }, false) === '▸ 记忆反思 · 已更新 2 条')
-  check('dream 新增', foldLabel({ ...base, variant: 'dream', rememberCount: 1 }, true) === '▾ 记忆整理 · 新增记忆 1 条')
+  check('dream 新增', foldLabel({ ...base, variant: 'dream', rememberCount: 1 }, true) === '▾ 记忆梦境任务 · 新增记忆 1 条')
   check('中断', foldLabel({ ...base, status: 'interrupted' }, false) === '▸ 记忆反思已中断')
 }
 
@@ -188,6 +188,31 @@ console.log('=== 7. 并行 memory_remember 计数 ===')
   check('并行 3 次 remember 全数到', g.rememberCount === 3)
   check('memory_search 不计', g.updateCount === 0)
   check('文案显示新增 3 条', foldLabel(g, false).includes('新增记忆 3 条'))
+}
+
+// ---- 9. 注入折叠：首轮长期记忆 / 关键词命中识别与解析 ----
+console.log('=== 9. computeInjectionGroups ===')
+{
+  const FIRST = '===== 长期记忆 =====\n【关于你】x\n===== 长期记忆结束 =====\n\n本轮用户prompt：\n\n你好'
+  const HIT = '可能相关的记忆，仅供参考：\n- [fact:abc] 内容\n------\n本轮用户prompt：\n\n再问一句'
+  const PLAIN = '普通消息没有注入'
+  const nodes = new Map([
+    ['u-first', userNode('u-first', turnLoc(1), [{ type: 'text', text: FIRST }])],
+    ['u-hit', userNode('u-hit', turnLoc(2), [{ type: 'text', text: HIT }])],
+    ['u-plain', userNode('u-plain', turnLoc(3), [{ type: 'text', text: PLAIN }])],
+    ['u-img', userNode('u-img', turnLoc(4), [{ type: 'text', text: HIT }, { type: 'image', attachment: {} }])],
+  ])
+  const s = snapshot(['u-first', 'u-hit', 'u-plain', 'u-img'], nodes, () => [])
+  const injs = computeInjectionGroups(s)
+  check('识别 2 个注入组（带图不折叠）', injs.length === 2)
+  const first = injs.find((g) => g.id === 'u-first')
+  check('首轮注入 kind=first', first?.kind === 'first')
+  check('首轮 userText 解析', first?.userText === '你好')
+  check('首轮 injectedText 含完整注入', first?.injectedText.includes('===== 长期记忆 =====') && first?.injectedText.includes('本轮用户prompt：'))
+  const hit = injs.find((g) => g.id === 'u-hit')
+  check('命中注入 kind=hit', hit?.kind === 'hit')
+  check('命中 userText 解析', hit?.userText === '再问一句')
+  check('命中 injectedText 含标记', hit?.injectedText.includes('可能相关的记忆，仅供参考：'))
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)

@@ -127,10 +127,79 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
 /** 横条文案（产品 copy，中文）。 */
 export function foldLabel(group: FoldGroup, expanded: boolean): string {
   const arrow = expanded ? '▾' : '▸'
-  const title = group.variant === 'dream' ? '记忆整理' : '记忆反思'
+  const title = group.variant === 'dream' ? '记忆梦境任务' : '记忆反思'
   if (group.status === 'running') return `${arrow} ${title}进行中…`
   if (group.status === 'interrupted') return `${arrow} ${title}已中断`
   if (group.rememberCount > 0) return `${arrow} ${title} · 新增记忆 ${group.rememberCount} 条`
   if (group.updateCount > 0) return `${arrow} ${title} · 已更新 ${group.updateCount} 条`
   return `${arrow} ${title} · 无需记忆`
+}
+
+/** 渲染一个 tool 调用的详情文本：名称 + 格式化参数（JSON pretty）。 */
+export function toolCallDetail(block: { name: string; argsRaw: string }): string {
+  let args = block.argsRaw
+  try {
+    args = JSON.stringify(JSON.parse(block.argsRaw), null, 2)
+  } catch {
+    /* 非 JSON 参数原样展示 */
+  }
+  return args.length > 0 ? `${block.name}\n${args}` : block.name
+}
+
+/** 从 content blocks 提取纯文本（tool result / 消息正文）。 */
+export function blocksToText(blocks: readonly { type?: string; text?: string }[]): string {
+  return blocks
+    .map((block) => block.text ?? '')
+    .join('\n')
+    .trim()
+}
+
+// ── 注入折叠（首轮长期记忆 / 每消息关键词命中） ─────────────────────────────
+
+/** 首轮注入文本的开头标记（与 host 端 buildInjection 保持一致）。 */
+export const FIRST_INJECTION_MARKER = '===== 长期记忆 ====='
+/** 命中注入文本的开头标记（与 host 端 buildHitInjection 保持一致）。 */
+export const HIT_INJECTION_MARKER = '可能相关的记忆，仅供参考：'
+/** 注入文本与用户 prompt 的分隔标记（两种注入都以它结尾）。 */
+export const PROMPT_SEPARATOR = '本轮用户prompt：'
+
+export type InjectionKind = 'first' | 'hit'
+
+/** 一个含注入前缀的用户消息（前端折叠成横条，只显示用户 prompt）。 */
+export interface InjectionGroup {
+  /** user 节点的 key（快照 chat 节点 key）。 */
+  readonly id: string
+  readonly kind: InjectionKind
+  /** 注入的完整文本（含分隔标记）。 */
+  readonly injectedText: string
+  /** 用户 prompt 原文（分隔标记之后）。 */
+  readonly userText: string
+}
+
+/**
+ * 识别含注入前缀的用户消息（首轮长期记忆 / 关键词命中）。
+ * pre-step 把注入文本 prepend 到用户消息的 text block，两者以
+ * 「本轮用户prompt：」分隔——前端据此折叠注入、只显示用户 prompt。
+ * 仅折叠纯文本消息（content 全是 text block）——带附件/图片的消息保持原样
+ * （前端折叠会重建文本气泡，附件会丢）。
+ */
+export function computeInjectionGroups(snapshot: ConversationSnapshot): InjectionGroup[] {
+  const groups: InjectionGroup[] = []
+  for (const key of snapshot.chat.order) {
+    const node = snapshot.chat.nodes.get(key)
+    if (node === undefined || node.kind !== 'user') continue
+    const content = (node.data as { content?: readonly { type?: string; text?: string }[] }).content ?? []
+    if (content.length === 0 || content.some((b) => b.type !== 'text')) continue // 带附件不折叠
+    const text = blocksToText(content)
+    if (text.length === 0) continue
+    let kind: InjectionKind | null = null
+    if (text.startsWith(FIRST_INJECTION_MARKER)) kind = 'first'
+    else if (text.startsWith(HIT_INJECTION_MARKER)) kind = 'hit'
+    if (kind === null) continue
+    const sepIdx = text.lastIndexOf(PROMPT_SEPARATOR)
+    if (sepIdx === -1) continue // 没有分隔标记（异常数据）：不折叠
+    const userText = text.slice(sepIdx + PROMPT_SEPARATOR.length).replace(/^\n+/, '')
+    groups.push({ id: key, kind, injectedText: text.slice(0, sepIdx + PROMPT_SEPARATOR.length), userText })
+  }
+  return groups
 }

@@ -38,10 +38,11 @@ export function workspaceOf(exec: ToolRunContext): string | undefined {
 }
 
 export function sessionIdOf(exec: ToolRunContext): string | null {
-  const header = (exec.agent?.session?.header ?? {}) as { id?: unknown; parentSession?: unknown }
+  const header = (exec.agent?.session?.header ?? {}) as { id?: unknown; parentSession?: unknown; origin?: unknown }
   const id = typeof header.id === 'string' && header.id.length > 0 ? header.id : null
-  // 子 agent：source_session 继承母窗口（用户拍板：子 agent 写记忆归属父窗口）
-  if (header.parentSession !== undefined) {
+  // 子 agent（origin='subagent'）：source_session 继承母窗口（用户拍板：子 agent 写记忆归属父窗口）。
+  // 注意：GUI fork/续写的主会话也有 parentSession 但 origin 无——不继承（它是独立主会话）。
+  if (header.origin === 'subagent' && header.parentSession !== undefined) {
     const p = header.parentSession
     if (typeof p === 'string' && p.length > 0) return p
     if (p !== null && typeof p === 'object' && typeof (p as { id?: unknown }).id === 'string') {
@@ -237,6 +238,8 @@ function searchTool(dir: string): ToolDefinition {
     name: 'memory_search',
     description: [
       '在当前工作区记忆库中检索记忆（BM25 × 近期权重）。',
+      'query 必填且不能为空——传你要查的关键词/句子，如 memory_search({query: "记忆插件 部署"})；',
+      '想浏览某项目全貌请用 memory_project（不需要 query），不要用空 query 调本工具。',
       '范围：只检索其他会话建立的记忆；本会话已经注入过或检索过的条目自动排除（它们已在上下文里可见，不重复占用）。',
       '默认搜索范围=fact+lesson+topic+rules；level 支持逗号多选（如 fact,lesson）；想看项目全景传 level=project。',
       '返回按相关度取 top-k 后按记忆时间戳重排（旧→新，供判断发展过程与新旧冲突）。',
@@ -246,7 +249,7 @@ function searchTool(dir: string): ToolDefinition {
       additionalProperties: false,
       required: ['query'],
       properties: {
-        query: { type: 'string', description: '检索关键词/句子。' },
+        query: { type: 'string', description: '检索关键词/句子（必填，不能为空；例："记忆插件 部署"）。' },
         level: { type: 'string', description: '限定层级，逗号多选：fact/lesson/topic/rules/project/soul/user（默认 fact,lesson,topic,rules）。' },
         project: { type: 'string', description: '按项目名过滤（见记忆导引中的项目列表）。' },
         status: { type: 'string', enum: ['active', 'archived', 'stale', 'all'], description: '按状态过滤（默认 active；todo 类的 stale 视为已完成参与）。' },
@@ -293,7 +296,7 @@ function searchTool(dir: string): ToolDefinition {
     async execute(args: unknown, exec: ToolRunContext) {
       const parsed = args as { query?: unknown; level?: unknown; project?: unknown; status?: unknown; days?: unknown; k?: unknown; content_max?: unknown }
       const query = typeof parsed.query === 'string' ? parsed.query.trim() : ''
-      if (!query) throw new Error('memory_search: query 不能为空')
+      if (!query) throw new Error('memory_search: query 必填且不能为空（例：{"query": "关键词"}）；浏览项目全貌请用 memory_project')
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_search: 无法确定工作区（会话无 cwd）')
       const db = getDb(workspace, dir)
