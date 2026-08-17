@@ -4,7 +4,7 @@
 | :---: | :---: | :---: |
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件。
-源自 "meow" 分支——因此得名——但可在任意 DSH profile 上使用。
+
 
 **核心理念**：每个工作区维护一份结构化记忆数据库（`.dsh-meow/memory.db`，基于 `node:sqlite`）。
 静态工具手册（七层结构 + 每个 `memory_*` 工具的用法）以固定 section 的形式放在 **system prompt** 里——
