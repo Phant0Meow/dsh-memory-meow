@@ -24,7 +24,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Phant0Meow/dsh-memory-meow.git"
+    "url": "git+https://github.com/Phant0Meow/dsh-meow-memory.git"
   },
   "license": "MIT",
   "dsh": {
