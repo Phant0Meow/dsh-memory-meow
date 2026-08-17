@@ -369,9 +369,12 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig, dir = '.dsh-meow',
       // 用 db 持久化的 last_event_time 判定——不受模块实例/热重载影响
       // （内存全局 lastActivity 只作快速路径，见上方 gate）。
       if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) continue
+      const agentsSvc = typeof ctx.get === 'function'
+        ? (ctx.get('agents') as { get?: (id: unknown) => unknown } | undefined)
+        : undefined
       const agent =
         liveAgents.get(sessionId) ??
-        (typeof ctx.agents?.get === 'function' ? ctx.agents.get(sessionId) : undefined)
+        (agentsSvc !== undefined && typeof agentsSvc.get === 'function' ? agentsSvc.get(sessionId) : undefined)
       if (!agent) {
         dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)}`)
         continue // 进程内无该窗口 agent（重启后）：跳过
