@@ -4,7 +4,6 @@
 | :---: | :---: | :---: |
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
-Born from the "meow" fork — hence the name — but works on any DSH profile.
 
 **The idea**: every workspace keeps a structured memory database (`.dsh-meow/memory.db`,
 SQLite via `node:sqlite`). The static tool manual (seven layers + every `memory_*` tool's
