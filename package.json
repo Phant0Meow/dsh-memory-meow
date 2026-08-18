@@ -19,7 +19,10 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib",
+    "lib/index.js",
+    "lib/index.js.map",
+    "lib/client.js",
+    "lib/client.js.map",
     "cordis.patch.yml"
   ],
   "repository": {
