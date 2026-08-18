@@ -79,8 +79,8 @@ last conversation timestamp.
   interrupted-dream auto-recovery + orphan finalization (a finished dream turn always lands
   `last_dream_time`, even across hot-reload instances); plugin-turn events don't refresh
   window activity — an already-dreamed window is never re-dreamed.
-- **Zero runtime dependencies**: `node:sqlite` (built into Node ≥22.5) + self-contained esbuild
-  bundle (`lib/index.js`). No native modules.
+- **Zero runtime dependencies**: `node:sqlite` (default-enabled on Node ≥22.13; 22.5–22.12 needs
+  `--experimental-sqlite`) + self-contained esbuild bundle (`lib/index.js`). No native modules.
 
 ## 📦 Install
 

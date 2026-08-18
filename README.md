@@ -62,7 +62,7 @@
 - **dream 防重复**：check 门（DB 原子 60s 检查节流）+ start 幂等抢占（`dream_pending`）+
   中断自愈（未收尾的 dream 自动补收尾）+ 孤儿收尾（跨实例/热重载后 turn 结束也能收尾）；
   插件注入轮的事件不刷新窗口活跃度——已 dream 的窗口不会反复被 dream。
-- **零运行时依赖**：`node:sqlite`（Node ≥22.5 内置）+ 自包含 esbuild 产物（`lib/index.js`）。
+- **零运行时依赖**：`node:sqlite`（Node ≥22.13 默认可用；22.5–22.12 需 `--experimental-sqlite`）+ 自包含 esbuild 产物（`lib/index.js`）。
   无原生模块。
 
 ## 📦 安装
