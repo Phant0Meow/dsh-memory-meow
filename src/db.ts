@@ -144,7 +144,11 @@ export class MemoryDb {
       workspace TEXT,
       last_event_time INTEGER,
       last_dream_time INTEGER,
-      dream_pending INTEGER NOT NULL DEFAULT 0
+      dream_owner TEXT,
+      dream_started_at INTEGER,
+      dream_progress_at INTEGER,
+      dream_group_idx INTEGER,
+      dream_T INTEGER
     )`)
     this.db.exec(`CREATE TABLE IF NOT EXISTS dream_meta (
       key TEXT PRIMARY KEY,
@@ -179,12 +183,22 @@ export class MemoryDb {
         this.db.prepare(`UPDATE ${level} SET id = ? WHERE id = ?`).run(newId(created), id)
       }
     }
-    // windows 表：v0.9.0 加 dream_pending（dream 进行中标记，跨进程/重启防重复 dream）
+    // windows 表：v0.10.0 起用租约（dream_owner/progress_at/...）替代 dream_pending 布尔。
+    // 老库补列；老「dream_pending=1」迁移为「过期租约」——下个检查周期按租约过期补收尾。
     const wCols = new Set(
       (this.db.prepare('PRAGMA table_info(windows)').all() as Array<{ name: string }>).map((c) => c.name),
     )
-    if (!wCols.has('dream_pending')) {
-      this.db.exec('ALTER TABLE windows ADD COLUMN dream_pending INTEGER NOT NULL DEFAULT 0')
+    for (const [col, ddl] of [
+      ['dream_owner', 'TEXT'],
+      ['dream_started_at', 'INTEGER'],
+      ['dream_progress_at', 'INTEGER'],
+      ['dream_group_idx', 'INTEGER'],
+      ['dream_T', 'INTEGER'],
+    ] as const) {
+      if (!wCols.has(col)) this.db.exec(`ALTER TABLE windows ADD COLUMN ${col} ${ddl}`)
+    }
+    if (wCols.has('dream_pending')) {
+      this.db.exec(`UPDATE windows SET dream_owner = 'legacy-pending', dream_started_at = 0, dream_progress_at = 0, dream_group_idx = 0, dream_T = last_event_time WHERE dream_pending = 1 AND dream_owner IS NULL`)
     }
   }
 
@@ -383,31 +397,67 @@ export class MemoryDb {
     this.db.prepare(`UPDATE windows SET last_dream_time = ? WHERE session_id = ?`).run(time, sessionId)
   }
 
-  /** 原子抢占 dream 任务（跨进程/实例防重复 start）：返回 true 表示抢占成功（可 start）。
-   *   UPDATE 条件写 dream_pending=0，SQLite 语句级原子——多个进程并发时只有一个成功。 */
-  claimDream(sessionId: string): boolean {
+  /** 原子抢占 dream 租约（跨进程/实例防重复 start）：返回 true 表示抢占成功（可 start）。
+   *  条件：无租约（owner IS NULL）或租约已过期（progress_at 超 leaseMs）。owner 只用于抢占判断 + 诊断；
+   *  推进/收尾按「sessionId + 租约未过期」判定，不校验 owner。 */
+  claimDream(sessionId: string, owner: string, T: number, leaseMs: number): boolean {
     this.db
-      .prepare(`INSERT OR IGNORE INTO windows (session_id, workspace, last_event_time, last_dream_time, dream_pending)
-        VALUES (?, NULL, 0, NULL, 0)`)
+      .prepare(`INSERT OR IGNORE INTO windows (session_id, workspace, last_event_time, last_dream_time) VALUES (?, NULL, 0, NULL)`)
       .run(sessionId)
+    const now = Date.now()
     return (
       this.db
-        .prepare(`UPDATE windows SET dream_pending = 1 WHERE session_id = ? AND dream_pending = 0`)
-        .run(sessionId).changes === 1
+        .prepare(
+          `UPDATE windows SET dream_owner = ?, dream_started_at = ?, dream_progress_at = ?, dream_group_idx = 0, dream_T = ?
+           WHERE session_id = ? AND (dream_owner IS NULL OR dream_progress_at IS NULL OR dream_progress_at <= ?)`,
+        )
+        .run(owner, now, now, T, sessionId, now - leaseMs).changes === 1
     )
   }
 
-  /** dream 收尾：清进行中标记 + 记 last_dream_time（dream 完成时刻）。 */
+  /** dream 收尾：清租约 + 记 last_dream_time（dream 完成时刻）。 */
   finishDream(sessionId: string, time: number): void {
-    this.db.prepare(`UPDATE windows SET dream_pending = 0, last_dream_time = ? WHERE session_id = ?`).run(time, sessionId)
+    this.db
+      .prepare(`UPDATE windows SET dream_owner = NULL, dream_started_at = NULL, dream_progress_at = NULL, dream_group_idx = NULL, dream_T = NULL, last_dream_time = ? WHERE session_id = ?`)
+      .run(time, sessionId)
   }
 
-  /** 该窗口是否有未收尾的 dream（start 过但未 done：进程重启/热重载/跨进程打断）。 */
+  /** 是否有进行中/未收尾的 dream（租约存在，无论是否过期）。 */
   isDreamPending(sessionId: string): boolean {
-    const row = this.db.prepare(`SELECT dream_pending FROM windows WHERE session_id = ?`).get(sessionId) as
-      | { dream_pending: number }
+    const row = this.db.prepare(`SELECT dream_owner FROM windows WHERE session_id = ?`).get(sessionId) as
+      | { dream_owner: string | null }
       | undefined
-    return row?.dream_pending === 1
+    return row?.dream_owner != null
+  }
+
+  /** 读窗口当前 dream 租约；无租约返回 null。 */
+  getDreamLease(sessionId: string): { owner: string; started_at: number; progress_at: number; group_idx: number; T: number } | null {
+    const row = this.db
+      .prepare(`SELECT dream_owner, dream_started_at, dream_progress_at, dream_group_idx, dream_T FROM windows WHERE session_id = ?`)
+      .get(sessionId) as
+      | { dream_owner: string | null; dream_started_at: number | null; dream_progress_at: number | null; dream_group_idx: number | null; dream_T: number | null }
+      | undefined
+    if (!row || row.dream_owner == null) return null
+    return {
+      owner: row.dream_owner,
+      started_at: row.dream_started_at ?? 0,
+      progress_at: row.dream_progress_at ?? 0,
+      group_idx: row.dream_group_idx ?? 0,
+      T: row.dream_T ?? 0,
+    }
+  }
+
+  /** CAS 推进租约：group_idx +1 并刷新心跳。多实例同收 turn-stopping 时只有一个成功。 */
+  advanceDreamLease(sessionId: string, fromIdx: number, leaseMs: number): boolean {
+    const now = Date.now()
+    return (
+      this.db
+        .prepare(
+          `UPDATE windows SET dream_group_idx = dream_group_idx + 1, dream_progress_at = ?
+           WHERE session_id = ? AND dream_group_idx = ? AND dream_owner IS NOT NULL AND dream_progress_at > ?`,
+        )
+        .run(now, sessionId, fromIdx, now - leaseMs).changes === 1
+    )
   }
 
   // ── 全局检查门（dream 定时器防叠加） ─────────────────────────────────────

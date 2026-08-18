@@ -527,7 +527,7 @@ function updateTool(dir: string): ToolDefinition {
     name: 'memory_update',
     description: [
       '更新记忆库中某条记忆（内容/标题/重要性/状态/话题目标句等）。',
-      'status 取值：active / archived（事项已完成，保留不删除）/ stale（久无进展待复核）。',
+      'status 取值：active / stale（完结：todo 完成、话题达成目标 → stale 视为 done）/ archived（删除，过时作废/重复/被替代的条目）。',
     ].join(' '),
     parameters: {
       type: 'object',
@@ -712,8 +712,8 @@ function projectTool(dir: string): ToolDefinition {
         sections.join('\n\n'),
         '',
         '——',
-        '说明：此处只提供未过时的信息。',
-        `如果你想看已过时的条目（archived/stale），或某条记忆的具体时间戳（记忆时间戳=该窗口 dream 封存时刻）、记忆来源（source_session）、重要性、关键词等元数据，可以直接去搜记忆库 SQLite：${dbPath}`,
+        '说明：此处只提供 active 的记忆。',
+        `如果你想看非 active 条目（archived=删除 / stale=完结），或某条记忆的具体时间戳（记忆时间戳=该窗口 dream 封存时刻）、记忆来源（source_session）、重要性、关键词等元数据，可以直接去搜记忆库 SQLite：${dbPath}`,
         '（库内结构：七层表 soul/user/project/fact/lesson/topic/rules，字段含 id/title/content/importance/keywords/status/corrected/project/subcategory/goal/source_session/created_at/updated_at（记忆时间戳=最后更新时间）/last_accessed_at；另有 dream_log 整理留痕表、windows 窗口时间表；也可按 id 用 memory_read 看单条完整元数据）',
         `如果你想了解未被记录的更多细节，可以直接去搜会话历史目录（dsh 的 session 日志，位置由 DSH_HOME 决定，默认 ~/.dsh/sessions，喵版为 dsh-home/sessions），按会话 id 查原始记录。`,
       ].join('\n')

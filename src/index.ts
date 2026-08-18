@@ -23,6 +23,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { closeAllDbs, getDb } from './db.js'
 import {
+  abortDream,
   advanceDream,
   DREAM_MARKER,
   dreamTool,
@@ -64,8 +65,8 @@ lesson=教训 / topic=话题 / rules=设计原则与行为准则）。记忆按"
 - memory_project —— 当你需要全面了解某个项目的整体概述、设计历史、技术决策、用户原话或进度时使用。
 - memory_find_similar —— 按 id 找内容相似条目（查重/找冲突用）。
 - memory_read —— 读完整条目（含元数据）。
-- memory_update —— 改条目（content/status 含 archived=完结、stale=过时；todo 的 stale=已完成；
-  importance/goal/project/subcategory/keywords（手动修正关键词，默认自动提取））。
+- memory_update —— 改条目（content/status 含 stale=完结（todo 完成、话题达成目标 → stale）；
+  archived=删除；importance/goal/project/subcategory/keywords（手动修正关键词，默认自动提取））。
 - memory_dream —— 立即整理本窗口记忆（通常夜间自动）。`
 
 // ── 性能诊断（perf.log，固定位置 ~/.dsh-meow/perf.log；卡死时查数据） ────────
@@ -382,9 +383,7 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     const t0 = Date.now()
     if (agent.session.header.origin === 'subagent') return // 子代理不参与（origin 权威判定）
     registerLiveAgent(agent)
-    // 用户按停止（aborted/interrupted）：不反思、不推进——停止就是要停，别又开新请求
     const endReason = lastTurnEndReason(agent.session.events)
-    if (endReason === 'aborted' || endReason === 'interrupted') return
     const dreamTurn = wasDreamTurn(agent.session.events)
     const wsTs = workspaceOfAgent(agent)
     const sidTs = sessionIdOfAgent(agent)
@@ -393,10 +392,17 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
         appendFileSync(join(wsTs, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] turn-stopping pid=${process.pid} sid=${shortSessionId(sidTs)} reason=${endReason ?? 'none'} wasDream=${dreamTurn}\n`)
       } catch { /* 日志失败不阻塞 */ }
     }
+    // 用户按停止（aborted/interrupted）：不反思、不推进下一组；但 dream 轮必须立即收尾，
+    // 否则 DB 租约残留，窗口要等租约过期（30min）才能再 dream。
+    if (endReason === 'aborted' || endReason === 'interrupted') {
+      if (dreamTurn) abortDream(agent, resolved.projectDir)
+      return
+    }
     if (dreamTurn) {
       advanceDream(agent, resolved.projectDir) // dream 轮：推进下一组或收尾（含孤儿收尾）
       return
     }
+
     if (!resolved.reflect) return
     const ws = workspaceOfAgent(agent)
     if (!ws) return
@@ -489,4 +495,4 @@ export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
-export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, isDreaming, noteActivity, hourInTimeZone, startWindowDream, advanceDream, recoverInterruptedDream } from './dream.js'
+export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, startWindowDream, advanceDream, abortDream, recoverInterruptedDream } from './dream.js'

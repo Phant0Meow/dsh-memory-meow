@@ -24,6 +24,7 @@ import {
   windowNeedsDream,
   startWindowDream,
   advanceDream,
+  abortDream,
   recoverInterruptedDream,
   findSimilar,
   markSearched,
@@ -116,17 +117,25 @@ check('window needs dream (new chat after dream)', windowNeedsDream({ last_event
 check('window no dream (dream after chat)', windowNeedsDream({ last_event_time: Date.now(), last_dream_time: Date.now() + 1000 }) === false)
 check('window no dream (older than 24h)', windowNeedsDream({ last_event_time: Date.now() - 25 * 3600_000, last_dream_time: null }) === false)
 
-// dream 抢占与收尾（防重复 dream：跨进程/重启后状态一致）
-check('claimDream succeeds first', dbW.claimDream('win-1') === true)
-check('claimDream second fails (pending)', dbW.claimDream('win-1') === false)
+// dream 抢占与收尾（租约：防重复 dream，跨进程/重启后状态一致）
+const LEASE = 60_000
+check('claimDream succeeds first', dbW.claimDream('win-1', 'o1', 1000, LEASE) === true)
+check('claimDream second fails (active lease)', dbW.claimDream('win-1', 'o2', 1000, LEASE) === false)
 check('isDreamPending true', dbW.isDreamPending('win-1') === true)
+check('getDreamLease reads owner/idx/T', (() => { const l = dbW.getDreamLease('win-1'); return l !== null && l.owner === 'o1' && l.group_idx === 0 && l.T === 1000 })())
 dbW.finishDream('win-1', 3000)
-check('finishDream clears pending', dbW.isDreamPending('win-1') === false)
+check('finishDream clears lease', dbW.isDreamPending('win-1') === false && dbW.getDreamLease('win-1') === null)
 check('finishDream sets last_dream_time', dbW.getWindow('win-1')?.last_dream_time === 3000)
-check('claimDream succeeds after finish', dbW.claimDream('win-1') === true)
-check('claim on missing window creates row', dbW.claimDream('win-missing') === true &&
-  dbW.getWindow('win-missing')?.dream_pending === 1)
+check('claimDream succeeds after finish', dbW.claimDream('win-1', 'o3', 1000, LEASE) === true)
+check('claim on missing window creates row', dbW.claimDream('win-missing', 'o4', 1000, LEASE) === true &&
+  dbW.getDreamLease('win-missing')?.owner === 'o4')
 dbW.finishDream('win-missing', 0)
+dbW.finishDream('win-1', 0)
+// 租约过期后可被重新抢占（模拟主人死亡）
+dbW.claimDream('win-1', 'o5', 1000, LEASE)
+dbW.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * LEASE, 'win-1')
+check('claimDream reclaims expired lease', dbW.claimDream('win-1', 'o6', 2000, LEASE) === true)
+check('getDreamLease reads reclaimed owner/T', (() => { const l = dbW.getDreamLease('win-1'); return l !== null && l.owner === 'o6' && l.T === 2000 })())
 dbW.finishDream('win-1', 0)
 
 // 全局检查门：minIntervalMs 内只有一个调用方通过（防多实例/多定时器叠加重复检查）
@@ -163,40 +172,52 @@ check('dream message rules', dtxt.includes('原话') && dtxt.includes('importanc
 check('dream rules require project param', dtxt.includes('project 参数'))
 dbD.close()
 
-// startWindowDream 抢占 + advanceDream 收尾 + 补收尾（防重复 dream 链路）
+// startWindowDream 抢占 + advanceDream 收尾 + 补收尾 + abortDream（租约链路）
 const wsClaim = mkdtempSync(join(tmpdir(), 'mm-claim-'))
 const dbClaim = new MemoryDb(memoryDbPath(wsClaim))
 dbClaim.touchWindow('win-claim', wsClaim, Date.now())
-const agentClaim = { session: { header: { id: 'win-claim' } }, steer: () => {} }
+const agentClaim = { session: { header: { id: 'win-claim', cwd: wsClaim } }, steer: () => {} }
 check('startWindowDream: no memories → false', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
 dbClaim.insert({ level: 'fact', content: '待整理的记忆', source_session: 'win-claim' })
 check('startWindowDream: ok', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
 check('startWindowDream: second rejected while running', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
-check('pending flag set while running', dbClaim.isDreamPending('win-claim') === true)
-advanceDream(agentClaim) // 收尾（1 组）
-check('advanceDream finishes → pending cleared', dbClaim.isDreamPending('win-claim') === false)
+check('lease set while running', dbClaim.getDreamLease('win-claim') !== null)
+advanceDream(agentClaim, '.dsh-meow') // 收尾（1 组）
+check('advanceDream finishes → lease cleared', dbClaim.getDreamLease('win-claim') === null)
 check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 check('startWindowDream: ok again after finish', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
-// 模拟中断：start 后不 advance（如同进程崩溃/重载），补收尾恢复
-dbClaim.finishDream('win-claim', 0) // 先清掉上面 start 的标记，模拟"标记残留"
-check('recoverInterruptedDream clears pending', (() => {
-  dbClaim.touchWindow('win-claim', wsClaim, Date.now())
-  const n = recoverInterruptedDream(dbClaim, 'win-claim', wsClaim, '.dsh-meow')
-  return dbClaim.isDreamPending('win-claim') === false && dbClaim.getWindow('win-claim')?.last_dream_time !== null && n >= 0
-})())
+// 模拟中断：start 后不 advance（如同进程崩溃/重载），租约过期后补收尾恢复
+dbClaim.db.prepare('UPDATE windows SET dream_progress_at = ? WHERE session_id = ?').run(Date.now() - 2 * 30 * 60_000, 'win-claim')
+const nRecover = recoverInterruptedDream(dbClaim, 'win-claim', wsClaim, '.dsh-meow')
+check('recoverInterruptedDream clears lease', dbClaim.getDreamLease('win-claim') === null && dbClaim.getWindow('win-claim')?.last_dream_time !== null && nRecover >= 0)
+// abortDream 立即收尾（用户中止）
+dbClaim.insert({ level: 'fact', content: '中止用记忆', source_session: 'win-claim' })
+dbClaim.touchWindow('win-claim', wsClaim, Date.now())
+startWindowDream({}, agentClaim, wsClaim, '.dsh-meow')
+abortDream(agentClaim, '.dsh-meow')
+check('abortDream finalizes immediately', dbClaim.getDreamLease('win-claim') === null && dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 dbClaim.close()
 
-// 孤儿收尾（根因修复 2026-08-16）：turn 结束的窗口不是本实例 currentDream
-// （残留 fiber 跨实例 start）→ advanceDream 无条件补收尾，断反复 dream 永动机
+// 跨实例推进（原「孤儿收尾」）：状态在 DB 租约，任何实例的 turn-stopping 都能推进/收尾
 const wsOrphan = mkdtempSync(join(tmpdir(), 'mm-orphan-'))
 const dbOrphan = new MemoryDb(memoryDbPath(wsOrphan))
 dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
 dbOrphan.insert({ level: 'fact', content: '孤儿窗口的记忆', source_session: 'win-orphan' })
-dbOrphan.claimDream('win-orphan') // 模拟残留 fiber start 写了 pending
+dbOrphan.claimDream('win-orphan', 'residual-fiber', Date.now(), 60_000) // 模拟残留 fiber start 写了租约
 advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow')
-check('orphan dream recovered by advanceDream', dbOrphan.isDreamPending('win-orphan') === false &&
+check('orphan dream finalized by advanceDream', dbOrphan.getDreamLease('win-orphan') === null &&
   dbOrphan.getWindow('win-orphan')?.last_dream_time !== null)
+// 多组推进：advanceDream 推进到下一组并 steer，而非直接收尾
+dbOrphan.insert({ level: 'fact', content: '第二组记忆', source_session: 'win-orphan', project: 'p2' })
+dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
+let steeredMsg = null
+const agent2 = { session: { header: { id: 'win-orphan', cwd: wsOrphan } }, steer: (m) => { steeredMsg = m } }
+startWindowDream({}, agent2, wsOrphan, '.dsh-meow')
+check('lease group_idx 0 after start', dbOrphan.getDreamLease('win-orphan')?.group_idx === 0)
+advanceDream(agent2, '.dsh-meow')
+check('advanceDream advances to group 1 + steers', dbOrphan.getDreamLease('win-orphan')?.group_idx === 1 && steeredMsg !== null)
 dbOrphan.close()
+
 
 // ── recall 增强：find_similar / seen 排除 ───────────────────────────────────
 const wsR = mkdtempSync(join(tmpdir(), 'mm-recall-'))
