@@ -90,8 +90,9 @@ function groupByProject(rows: MemoryRow[]): DreamGroup[] {
 
 /** dream 记忆范围（用户拍板 2026-08-19）：本窗口建立的 ∪ 本窗口提取过的
  *  （sessions/<id>.json 的 injected+searched，readSeen）。
- *  分两轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic）；
- *  第 2 轮=topic 记忆。空轮跳过（轮数动态 1 或 2，消息里显示"第 N/M 组"）。 */
+ *  分两轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），空则跳过；
+ *  第 2 轮=topic 记忆**默认触发**（用户拍板 2026-08-19：空也发——AI 回顾对话历史，
+ *  可能有新 topic 要创建）。 */
 export function collectDreamRounds(
   db: ReturnType<typeof getDb>,
   sessionId: string,
@@ -111,7 +112,7 @@ export function collectDreamRounds(
   }
   const rounds: DreamRound[] = []
   if (atomic.length > 0) rounds.push({ kind: 'atomic', groups: groupByProject(atomic) })
-  if (topic.length > 0) rounds.push({ kind: 'topic', groups: groupByProject(topic) })
+  rounds.push({ kind: 'topic', groups: groupByProject(topic) }) // topic 轮默认触发（空轮也让 AI 回顾建新 topic）
   return rounds
 }
 
@@ -164,18 +165,19 @@ const TOPIC_INTRO = [
   '如果你发现有topic记录混乱，比如一件事的前因在topic A，后果在topic B，但topic A和B分别还有其他乱七八糟的信息，你应该综合考虑这些事情发展脉络，将它们整理清楚。用最合理最清楚的方式把这些信息分解成几件事、几条发展脉络，每件事一个topic。',
 ]
 
-/** 第 2 轮（topic 记忆）更新指导（用户拍板 2026-08-19 终稿）。 */
+/** 第 2 轮（topic 记忆）更新指导（用户拍板 2026-08-19 终稿 v2：默认触发 + 回顾建新 topic）。 */
 const TOPIC_GUIDE = [
-  '# topic记忆更新指导：',
-  '1. 请你根据最新信息判断，这些topic中描述的事情，他们有新的发展、新的重要信息吗？请及时更新。你可以重新起草topic，将该话题的新进展加入，旧信息点如果你认为不再重要，可以删减。',
-  '2. 有没有哪些topic说的太庞杂跑题了，如果提了好几件事，你认为应该拆分，你可以把一个大topic拆成几个子topic（新建topic）。',
-  '3. 有没有哪几个topic其实在说同一件事，应该合并？请你合并。',
-  '4. 有没有哪几个topic信息交叉混乱，你认为应该将它们的信息合并后重新拆分，这样才能更清晰的分割成两件事？请你重写他们。',
-  '5. 更新topic时，你依然需要反向思考，"我写这条topic记忆是为了提供哪些信息？别人看到这条topic能看明白这个话题/事件的发展脉络吗？"',
-  '6. 写/改topic时，同时总结该topic记忆的关键词（提取 8-13 个内容词供检索；"你希望在用户提及什么关键词时，AI能看到这条记忆"）。',
-  '7. 要记录project信息（project名，或全局）、importance。',
-  '8. 对于你认为非常重要的topic，如果不确定事实到底如何，你可以直接翻项目文件来核实。仅对非常重要的记忆使用。',
-  '9. 完成后直接回复"本组整理完成"，不要调用其他工具。',
+  '# topic记忆更新指导——',
+  '1. 请你根据最新信息判断：这些topic中描述的事情，他们有新的发展、新的重要信息吗？请及时更新。你可以重新起草topic，将该话题的新进展加入，旧信息点如果你认为不再重要，可以删减。',
+  '2. 请你回顾对话历史，是否有新的topic可以存下？如有，请创建。如果你的任务没检索到任何topic记忆，那很可能就是一个新topic。',
+  '3. 有没有哪些topic说的太庞杂跑题了，如果提了好几件事，你认为应该拆分，你可以把一个大topic拆成几个子topic（新建topic）。',
+  '4. 有没有哪几个topic其实在说同一件事，应该合并？请你合并。',
+  '5. 有没有哪几个topic信息交叉混乱，你认为应该将它们的信息合并后重新拆分，这样才能更清晰的分割成两件事？请你重写他们。',
+  '6. 更新topic时，你依然需要反向思考，"我写这条topic记忆是为了提供哪些信息？别人看到这条topic能看明白这个话题/事件的发展脉络吗？"',
+  '7. 写/改topic时，同时总结该topic记忆的关键词（提取 8-13 个内容词供检索；"你希望在用户提及什么关键词时，AI能看到这条记忆"）。',
+  '8. 要记录project信息（project名，或全局）、importance。',
+  '9. 对于你认为非常重要的topic，如果不确定事实到底如何，你可以直接翻项目文件来核实。仅对非常重要的记忆使用。',
+  '10. 完成后直接回复"本组整理完成"，不要调用其他工具。',
 ]
 
 /** 构造一轮 dream 指令消息（两轮共用头部：封存时间戳 + 时间戳规则）。 */
@@ -203,6 +205,10 @@ export function buildDreamMessage(
   ]
   if (round.kind === 'topic') lines.push(...TOPIC_INTRO, '')
   lines.push('【本组记忆】：')
+  if (round.groups.length === 0) {
+    // topic 轮默认触发：空列表时提示 AI 回顾对话建新 topic（对应指导 2）。
+    lines.push('（本组暂无已建立的 topic 记忆——回顾对话历史，如有新 topic 请按下方指导 2 创建）')
+  }
   for (const g of round.groups) {
     lines.push('', `【project：${g.name === '' ? '无项目 - 全局信息，或缺少项目标签' : g.name}】`)
     for (const r of g.rows) lines.push(formatRow(r))

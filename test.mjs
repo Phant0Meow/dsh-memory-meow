@@ -189,18 +189,35 @@ check('dream round1 topic title + guide', d1.includes('第 2/2 组 - topic记忆
 check('dream round1 has topic rows, no atomic', d1.includes('话题X') && d1.includes('外来话题') && !d1.includes('事实1'))
 dbD.close()
 
+// topic 轮默认触发：窗口无任何记忆也发（空 topic 轮提示 AI 回顾建新 topic）
+const wsE = mkdtempSync(join(tmpdir(), 'mm-drem-'))
+const dbE = new MemoryDb(memoryDbPath(wsE))
+const eRounds = collectDreamRounds(dbE, 'win-e', wsE, '.dsh-meow')
+check('empty window still gets topic round', eRounds.length === 1 && eRounds[0].kind === 'topic' && eRounds[0].groups.length === 0)
+const eMsg = buildDreamMessage(dbE, 'win-e', 5000, eRounds, 0)
+const et = eMsg.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
+check('empty topic round hints new topic creation', et.includes('第 1/1 组 - topic记忆条目') && et.includes('很可能就是一个新topic'))
+dbE.close()
+
 // startWindowDream 抢占 + advanceDream 收尾 + 补收尾 + abortDream（租约链路）
 const wsClaim = mkdtempSync(join(tmpdir(), 'mm-claim-'))
 const dbClaim = new MemoryDb(memoryDbPath(wsClaim))
 dbClaim.touchWindow('win-claim', wsClaim, Date.now())
 const agentClaim = { session: { header: { id: 'win-claim', cwd: wsClaim } }, steer: () => {} }
-check('startWindowDream: no memories → false', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
+// topic 轮默认触发：无记忆窗口也启动（空 topic 轮让 AI 回顾建新 topic）
+check('startWindowDream: no memories still starts (topic round)', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
+check('lease set while running', dbClaim.getDreamLease('win-claim') !== null)
+advanceDream(agentClaim, '.dsh-meow') // 仅 topic 轮 → 收尾
+check('advanceDream finishes (only topic round)', dbClaim.getDreamLease('win-claim') === null)
+check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 dbClaim.insert({ level: 'fact', content: '待整理的记忆', source_session: 'win-claim' })
 check('startWindowDream: ok', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
 check('startWindowDream: second rejected while running', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === false)
 check('lease set while running', dbClaim.getDreamLease('win-claim') !== null)
-advanceDream(agentClaim, '.dsh-meow') // 收尾（1 组）
-check('advanceDream finishes → lease cleared', dbClaim.getDreamLease('win-claim') === null)
+advanceDream(agentClaim, '.dsh-meow') // 原子轮完成 → 推进到 topic 轮
+check('advanceDream advances to topic round', dbClaim.getDreamLease('win-claim')?.group_idx === 1)
+advanceDream(agentClaim, '.dsh-meow') // topic 轮完成 → 收尾
+check('advanceDream finishes after topic round', dbClaim.getDreamLease('win-claim') === null)
 check('advanceDream sets last_dream_time', dbClaim.getWindow('win-claim')?.last_dream_time !== null)
 check('startWindowDream: ok again after finish', startWindowDream({}, agentClaim, wsClaim, '.dsh-meow') === true)
 // 模拟中断：start 后不 advance（如同进程崩溃/重载），租约过期后补收尾恢复
@@ -221,7 +238,8 @@ const dbOrphan = new MemoryDb(memoryDbPath(wsOrphan))
 dbOrphan.touchWindow('win-orphan', wsOrphan, Date.now())
 dbOrphan.insert({ level: 'fact', content: '孤儿窗口的记忆', source_session: 'win-orphan' })
 dbOrphan.claimDream('win-orphan', 'residual-fiber', Date.now(), 60_000) // 模拟残留 fiber start 写了租约
-advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow')
+advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow') // 原子轮 → topic 轮
+advanceDream({ session: { header: { id: 'win-orphan', cwd: wsOrphan } } }, '.dsh-meow') // topic 轮 → 收尾
 check('orphan dream finalized by advanceDream', dbOrphan.getDreamLease('win-orphan') === null &&
   dbOrphan.getWindow('win-orphan')?.last_dream_time !== null)
 // 多轮推进：原子轮 + topic 轮两轮——advanceDream 先推进到第 2 轮并 steer，再推进收尾
