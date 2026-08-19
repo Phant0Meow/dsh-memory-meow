@@ -36,13 +36,15 @@
   该会话的当前项目；未锚定时命中只搜全局（用户闲聊不误伤）。
 - **缓存友好设计**：静态 `meow-memory:guide` section（order 130，紧随各 `tool:*` 说明之后）
   在 system prompt 中注册一次——文本恒定，KV 缓存友好。已见记忆（`injected` + `searched`）
-  按会话记录（`.dsh-meow/sessions/<id>.json`），绝不重复注入或重复检索；收到会话压缩
+  按会话记录（`.dsh-meow/sessions/<id>.json`）：注入绝不重复；`memory_search` 前 5 条按相关度
+  无脑取（不排除已见/本 session 建立的记忆），其余从排名后续绕开已见补齐；收到会话压缩
   信号（`compaction/*`）时释放已见记录，允许压缩后被再次命中提取。
 - **工具集**：`memory_remember`（写入，必填 content/project/keywords/importance 且缺失报错引导重填，
   自动去重合并，返回读回确认：关键词/项目归属）/
-  `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，按记忆时间戳排序；
-  返回检索元数据视图：归属 + 完整 id + 相对时间 + 关键词列表，不含原文）/
-  `memory_project`（项目全景注入段落：按子标签分组、未过时条目全给、每条带完整 id 与
+  `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，默认 top10 = 前 5 条
+  最相关不排除已见 + 后 5 条绕开已见补齐，按记忆时间戳排序；返回检索元数据视图：
+  归属 + 完整 id + 相对时间 + 关键词列表，不含原文）/
+  `memory_project`（项目全景注入段落：**project 参数必填**——你要看哪个项目的信息？按子标签分组、未过时条目全给、每条带完整 id 与
   最后更新时间戳、todo 输出「已完成：」最近 5 条 +「To do list：」，末尾附记忆库与
   会话历史定位说明）/
   `memory_find_similar`（查重与冲突检测）/ `memory_read` / `memory_update`（含 status
@@ -66,6 +68,14 @@
 - **反思轮折叠 UI（client 端）**：记忆反思/dream 轮的 prompt 与后续 think/tool call/汇报
   折叠成一条横条（默认折叠，显示「新增记忆 N 条」/「记忆梦境任务」），点击向下展开成
   卡片查看完整记录——卡片内 Think / tool call / 上下文注入均可点开查看细节。
+- **会话列表 dream 图标（client 端）**：左侧会话列表中，"dream 整理过记忆且之后无新对话
+  新信息"的会话行显示**淡黄色小月牙 🌙**；dream 轮进行中显示**白→金呼吸灯月牙**（替换 dsh
+  的运行中蓝色动画，避免与正常工作混淆）；有新活动即移除。图标放进 dsh 会话行的状态槽位
+  （替换槽内内容，标题零位移）。数据走事件驱动无轮询：`/meow-memory/dream-events` SSE
+  长连接——dream 开始推 `state:'dreaming'`、完成推 `state:'dreamed'`、有新活动推
+  `state:'active'`；client 挂载/断线重连时对 `/meow-memory/dreamed-sessions` 全量对账一次。
+  行定位零 dsh 改动：读 React 18 fiber（`__reactFiber$` 内部属性）拿会话行渲染 key =
+  session id，不依赖标题匹配。
 - **dream 防重复**：check 门（DB 原子 60s 检查节流）+ start 幂等抢占（`dream_pending`）+
   中断自愈（未收尾的 dream 自动补收尾）+ 孤儿收尾（跨实例/热重载后 turn 结束也能收尾）；
   插件注入轮的事件不刷新窗口活跃度——已 dream 的窗口不会反复被 dream。
@@ -146,7 +156,7 @@ npm install meow-memory
 ```sh
 npm install
 npm run build          # esbuild 打包 → lib/index.js（自包含）
-npm run test           # 196 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run test           # 214 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace 中，不在本包的 `node_modules` 里。

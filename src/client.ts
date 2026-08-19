@@ -21,6 +21,7 @@ import type { ConversationSnapshot } from '@deepseek-ai/dsh-client-runtime/clien
 import type { InputZone } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { AssistantChatData, ChatNode, ToolChatData } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { blocksToText, computeFoldGroups, computeInjectionGroups, foldLabel, toolCallDetail, type FoldGroup, type InjectionGroup } from './client-fold.ts'
+import { startDreamIconManager } from './client-dream-icon.ts'
 
 /** 折叠行标记（CSS 规则隐藏）。 */
 const FOLDED_ATTR = 'data-meow-memory-folded'
@@ -414,7 +415,10 @@ export function MemoryFoldDock({ session }: InputZone): null {
 export const inject = ['slots']
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function apply(ctx: any): void {
+export function apply(ctx: any): () => void {
+  const disposers: Array<() => void> = []
+  // 会话列表"已 dream"小月牙：独立于 slots，直接启动（host 路由不可用时静默降级）。
+  disposers.push(startDreamIconManager())
   // CSS 常驻全局（不随组件卸载移除：折叠行的隐藏由 data 属性驱动，规则在即生效）。
   const style = document.createElement('style')
   style.dataset.meowMemoryCss = 'true'
@@ -423,14 +427,23 @@ export function apply(ctx: any): void {
   const slots = ctx?.slots
   if (slots === undefined || typeof slots.inject !== 'function') {
     console.warn('[meow-memory] slots service unavailable; reflection folding disabled')
-    return
+  } else {
+    disposers.push(slots.inject('conversation.composer.dock', () => slots.register(
+      {
+        name: 'conversation.composer.dock',
+        id: 'meow-memory',
+        order: 90,
+      },
+      MemoryFoldDock,
+    )))
   }
-  slots.inject('conversation.composer.dock', () => slots.register(
-    {
-      name: 'conversation.composer.dock',
-      id: 'meow-memory',
-      order: 90,
-    },
-    MemoryFoldDock,
-  ))
+  return () => {
+    for (const dispose of disposers) {
+      try {
+        dispose()
+      } catch {
+        /* 清理失败不阻塞 */
+      }
+    }
+  }
 }

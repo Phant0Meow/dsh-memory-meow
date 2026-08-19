@@ -9,21 +9,20 @@
  */
 
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { findSimilar, search, tokenize } from './bm25.js'
+import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { getDb, getDreamWorkspace, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { readSeen, markSearched, setCurrentProject } from './inject.js'
 
 export type { Level }
 
-/** 检索范围过滤（用户拍板）：①自己 session 建立的记忆在上下文里，不检索；
- *  ②本 session 已注入/已检索过的（seen）不检索——省 token、扩大检索面。 */
+/** 检索范围过滤（查询参数）：只按 project/status/days 过滤。
+ *  已见（injected+searched）与本 session 建立的记忆不再预排除——search 先全量排名，
+ *  前 5 条无脑取（不排除任何记忆），第 6 名起绕开已见补齐（用户拍板 2026-08-19）。 */
 function filterSearchable(
   rows: MemoryRow[],
-  opts: { sessionId: string | null; seen: Set<string>; project?: string[] | null; status?: string[] | null; days?: number | null },
+  opts: { project?: string[] | null; status?: string[] | null; days?: number | null },
 ): MemoryRow[] {
   return rows.filter((r) => {
-    if (opts.sessionId && r.source_session === opts.sessionId) return false
-    if (opts.seen.has(r.id)) return false
     // project 多选（OR 语义）：任一项目覆盖即通过；"全局"/未标记天然覆盖。
     if (opts.project && opts.project.length > 0 && !opts.project.some((p) => projectCovers(r.project, p))) return false
     // status 多选（OR 语义）：'all' 表示不过滤。
@@ -237,7 +236,7 @@ function searchTool(dir: string): ToolDefinition {
       '在当前工作区记忆库中检索记忆（BM25 × 近期权重）。',
       'query 必填且不能为空——传你要查的关键词/句子，如 memory_search({query: "记忆插件 部署"})；',
       '想浏览某项目全貌请用 memory_project（不需要 query），不要用空 query 调本工具。',
-      '范围：只检索其他会话建立的记忆；本会话已经注入过或检索过的条目自动排除（它们已在上下文里可见，不重复占用）。',
+      '结果构成（用户拍板）：默认 top 10 = 前 5 条按相关度无脑取（不排除任何记忆，包括已注入/已检索/本 session 建立的）+ 后 5 条从后续排名绕开已注入/已检索的记忆补齐（保证新信息）。',
       '默认搜索范围=fact+lesson+topic+rules；level 支持逗号多选（如 fact,lesson）；想看项目全景传 level=project。',
       '返回按相关度取 top-k 后按记忆时间戳重排（旧→新，供判断发展过程与新旧冲突）。',
     ].join(' '),
@@ -274,7 +273,7 @@ function searchTool(dir: string): ToolDefinition {
                 title: { type: 'string' },
                 content: { type: 'string' },
                 keywords: { type: 'array', items: { type: 'string' }, description: '记忆关键词列表（LLM 提取或自动 bigram）。' },
-                project: { type: 'string', description: '项目归属；null=全局。' },
+                project: { type: 'string', description: '项目归属；""=未标记；全局信息为"全局"。' },
                 score: { type: 'number' },
                 updated_at: { type: 'number', description: '记忆时间戳（最后更新时间，毫秒）。' },
               },
@@ -330,7 +329,8 @@ function searchTool(dir: string): ToolDefinition {
         if (statusList.length > 1) return db.list(lv)
         return db.listSearchable(lv)
       })
-      const filtered = filterSearchable(rows, { sessionId, seen, project, status, days })
+      // 查询参数过滤（project/status/days）；不再预排除已见/本 session 建立的记忆。
+      const filtered = filterSearchable(rows, { project, status, days })
       const byId = new Map(filtered.map((r) => [r.id, r]))
       const docs = filtered.map((r) => ({
         id: r.id,
@@ -342,7 +342,19 @@ function searchTool(dir: string): ToolDefinition {
         created_at: r.created_at,
         updated_at: r.updated_at,
       }))
-      const hits = search(query, docs, { k })
+      // 全量排名（分高到低）后分段选取（用户拍板 2026-08-19）：
+      //   前 5 条无脑取（不排除任何记忆，含已见/本 session 建立的）；
+      //   第 6 名起逐个往下，绕开已见（injected+searched）的记忆补足，保证新信息。
+      const ranked = search(query, docs, { k: docs.length })
+      const blindCount = Math.min(5, k)
+      const blind = ranked.slice(0, blindCount)
+      const fresh: RankedHit[] = []
+      for (const h of ranked.slice(blindCount)) {
+        if (fresh.length >= k - blindCount) break
+        if (seen.has(h.id)) continue
+        fresh.push(h)
+      }
+      const hits = [...blind, ...fresh]
       for (const h of hits) db.bumpHit(h.level as Level, h.id)
       markSearched(workspace, sessionId ?? 'unknown', hits.map((h) => h.id), dir)
       // 按记忆时间戳（updated_at）重排：旧→新；null 视为最旧（从未封存/更新）。
@@ -357,7 +369,7 @@ function searchTool(dir: string): ToolDefinition {
             title: h.title ?? '',
             content: contentMax > 0 ? h.content.slice(0, contentMax) : h.content,
             keywords: row?.keywords ?? [],
-            project: row?.project ?? null,
+            project: row?.project ?? '',
             score: Math.round(h.score * 100) / 100,
             updated_at: h.updated_at ?? 0,
           }
@@ -649,6 +661,7 @@ function projectTool(dir: string): ToolDefinition {
     name: 'memory_project',
     description: [
       '取回某个项目在记忆库中的完整注入段落（纯文本，按子标签分组，未过时条目一口气全给）。',
+      'project 参数必填：你要看哪个项目的信息？不传会报错，先想清楚项目名再调用。',
       '当用户问起某个项目（femwa/meow-memory/meow-eyes/dsh…）的设计历史、技术决策、用户原话、项目进度时调用；',
       '也用于需要项目全景上下文再作答的场合。',
       '规则：组内按记忆时间戳旧→新；todo 子标签输出「已完成：」（最近完成 5 条）+「To do list：」；每条记忆带完整 id、最后更新时间戳与原文。',

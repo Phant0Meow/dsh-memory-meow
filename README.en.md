@@ -43,14 +43,17 @@ frozen at the last conversation timestamp.
 - **Cache-friendly by design**: the static `meow-memory:guide` section (order 130, right
   after the `tool:*` guidance sections) is registered in the system prompt once — constant
   text, KV-cache friendly. Already-seen memories (`injected` + `searched`) are recorded per
-  session (`.dsh-meow/sessions/<id>.json`) and never re-injected or re-searched; a
-  session-compaction signal (`compaction/*`) releases the seen records so compressed-away
+  session (`.dsh-meow/sessions/<id>.json`): injection never repeats, and `memory_search`
+  takes the top 5 by relevance unconditionally (seen / this-session memories included), then
+  fills the rest from the ranking while skipping already-seen entries; a session-compaction
+  signal (`compaction/*`) releases the seen records so compressed-away
   memories can be hit again.
 - **Toolset**: `memory_remember` (write, dedup merge, returns read-back confirmation:
   keywords/project; accepts a `keywords` parameter — reflection/dream turns have the LLM
   summarize 5–10 content words, auto bigram extraction as fallback) / `memory_search`
-  (BM25 × recency, filters: level/project/status/days, sorted by memory timestamp) /
-  `memory_project` (whole-project injection paragraph: grouped by subcategory, all
+  (BM25 × recency, filters: level/project/status/days, default top10 = top 5 by relevance
+  without excluding seen + 5 more skipping already-seen entries, sorted by memory timestamp) /
+  `memory_project` (whole-project injection paragraph: **`project` parameter is required** — which project do you want? grouped by subcategory, all
   non-stale entries, todo section with latest 5 done + to-do list, plus memory-db &
   session-history pointers) / `memory_find_similar` (duplicate & conflict detection) /
   `memory_read` / `memory_update` (incl. status active/archived/stale, importance, goal,
@@ -80,6 +83,17 @@ frozen at the last conversation timestamp.
   the report) collapse into a slim bar (collapsed by default, showing "N memories added" /
   "dream task"); clicking expands it into a card — Think / tool calls / context injections
   inside the card are expandable for details.
+- **Session-list dream icon (client)**: sessions that have been dream-consolidated with no
+  new conversation activity since show a **pale-yellow crescent-moon icon 🌙**; while a dream
+  turn is running the moon **breathes white→gold** (replacing dsh's running-blue animation so
+  it can't be mistaken for normal work); new activity removes the icon. The icon lives inside
+  the dsh session row's status slot (replacing its content — no layout shift). Event-driven,
+  no polling: the `/meow-memory/dream-events` SSE stream pushes `state:'dreaming'` when a
+  dream starts, `state:'dreamed'` when it finishes, `state:'active'` when a session gets new
+  activity; the client reconciles once against `/meow-memory/dreamed-sessions` on
+  mount/reconnect. Row targeting needs zero dsh changes: it reads the React 18 fiber
+  (`__reactFiber$` internal property) to get the row's render key = session id — no title
+  matching.
 - **Dream anti-repeat**: DB-atomic 60s check gate + atomic start claim (`dream_pending`) +
   interrupted-dream auto-recovery + orphan finalization (a finished dream turn always lands
   `last_dream_time`, even across hot-reload instances); plugin-turn events don't refresh
@@ -162,7 +176,7 @@ First user message (turn 1)      Every message from turn 2            night
 ```sh
 npm install
 npm run build          # esbuild bundle → lib/index.js (self-contained)
-npm run test           # 196 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run test           # 214 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's

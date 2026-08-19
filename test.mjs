@@ -35,6 +35,7 @@ import {
   getCurrentProject,
   setCurrentProject,
   hourInTimeZone,
+  collectDreamStates,
 } from './lib/index.js'
 
 let passed = 0
@@ -278,6 +279,24 @@ check('readSeen after markSearched', seenSet.has('seen-id-1'))
 check('readSeen empty for other session', readSeen(wsR, 'win-b', '.dsh-meow').size === 0)
 dbR.close()
 
+// ── 会话列表 dream 图标：collectDreamStates 全量判定（dreamed / dreaming 双态） ─
+const wsIcon = mkdtempSync(join(tmpdir(), 'mm-icon-'))
+const dbIcon = new MemoryDb(memoryDbPath(wsIcon))
+dbIcon.touchWindow('s-dreamed', wsIcon, Date.now() - 1000)
+dbIcon.finishDream('s-dreamed', Date.now() - 500) // dream 过且之后无活动
+dbIcon.touchWindow('s-active', wsIcon, Date.now() - 3000)
+dbIcon.finishDream('s-active', Date.now() - 2000)
+dbIcon.touchWindow('s-active', wsIcon, Date.now() - 1000) // dream 后有新活动
+dbIcon.touchWindow('s-nodream', wsIcon, Date.now()) // 从未 dream
+dbIcon.touchWindow('s-dreaming', wsIcon, Date.now() - 4000)
+dbIcon.claimDream('s-dreaming', 'owner-test', Date.now() - 3000, 30 * 60_000) // dream 进行中（活跃租约）
+const iconStates = collectDreamStates([{ id: 'any', cwd: wsIcon }])
+check('dream-states: dreamed/dreaming split', JSON.stringify(iconStates) === JSON.stringify({ dreamed: ['s-dreamed'], dreaming: ['s-dreaming'] }), JSON.stringify(iconStates))
+const wsNoDb = mkdtempSync(join(tmpdir(), 'mm-nodb-'))
+const iconStates2 = collectDreamStates([{ id: 'any', cwd: wsNoDb }])
+check('dream-states: workspace without memory db skipped (no db created)', iconStates2.dreamed.length === 0 && iconStates2.dreaming.length === 0 && !existsSync(join(wsNoDb, '.dsh-meow', 'memory.db')))
+dbIcon.close()
+
 // ── dream 时区（用户系统是美区时间，夜间窗口必须按 Asia/Shanghai 算） ───────
 const midnightUtc = new Date('2026-08-15T00:00:00.000Z')
 check('hourInTimeZone Shanghai at UTC midnight = 8', hourInTimeZone('Asia/Shanghai', midnightUtc) === 8)
@@ -346,7 +365,7 @@ if (inj) {
     inj.text.includes('【记忆导引】'))
   check('injection first line flush-left', inj.text.startsWith('===== 长期记忆 ====='))
   check('injection guide three lines', inj.text.includes('需要时用 memory_search 检索（必须传 query 检索词，不能空查）、memory_read 读取。') &&
-    inj.text.includes('当有项目相关任务时，应先用 memory_project 查项目全景，这样可以对项目有整体理解。') &&
+    inj.text.includes('当有项目相关任务时，应先用 memory_project 查项目全景（记得带上项目名，不能空参）') &&
     inj.text.includes('用户的所有 project：'))
   check('injection no topic/project title list', !inj.text.includes('- topic:') && !inj.text.includes('- project:'))
   check('injection format', inj.text.includes('===== 长期记忆结束 =====') && inj.text.includes('本轮用户prompt：'))
@@ -407,11 +426,43 @@ db.insert({ level: 'fact', content: '多选测试乙 独特内容', project: 'fe
 const sMulti = await searchTool.execute({ query: '多选测试', project: 'dsh,femwa' }, execCtx)
 check('search project multi-select OR', sMulti.hits.some((h) => h.project === 'dsh') && sMulti.hits.some((h) => h.project === 'femwa'))
 const sSingle = await searchTool.execute({ query: '多选测试', project: 'dsh' }, execCtx)
-check('search project single filter', sSingle.hits.every((h) => h.project === 'dsh' || h.project === '全局' || h.project === null))
+check('search project single filter', sSingle.hits.every((h) => h.project === 'dsh' || h.project === '全局' || h.project === null || h.project === ''))
 const sStatus = await searchTool.execute({ query: '多选测试', status: 'archived,stale' }, execCtx)
 check('search status multi-select no throw', Array.isArray(sStatus.hits))
 const searchRender = searchTool.output.render({}, { note: '', hits: [{ level: 'fact', id: '0msum4ifx-bf3a-0000000000000000000000', project: 'dsh', content: 'x', keywords: ['dream', '机制'], updated_at: Date.now() - 2 * 86_400_000 }] })
 check('search shows keywords + relative time, no content', searchRender.some((b) => b.text.includes('[dsh : fact]') && b.text.includes('关于：dream, 机制') && b.text.includes('2 天前') && !b.text.includes('记忆时间戳')))
+
+// search 5+5 分段（用户拍板 2026-08-19）：前 5 条无脑取（不排除已见/本 session 建立的），
+// 第 6 名起绕开已见（injected+searched）补齐。分数相同时排名稳定=插入序。
+const wsSplit = mkdtempSync(join(tmpdir(), 'mm-split-'))
+const dbSplit = new MemoryDb(memoryDbPath(wsSplit))
+for (let i = 1; i <= 12; i++) {
+  dbSplit.insert({ level: 'fact', content: `分段检索测试 内容${i} 特异性词${i}`, project: 'dsh', source_session: i === 5 || i === 12 ? 's-split' : 'win-other' })
+}
+const splitRows = dbSplit.list('fact')
+const sid = (n) => splitRows[n - 1].id // 排名 = 插入序（BM25 分数相同）
+markInjected(wsSplit, 's-split', [sid(1), sid(2)], '.dsh-meow')
+markSearched(wsSplit, 's-split', [sid(6), sid(7)], '.dsh-meow')
+const splitCtx = { agent: { session: { header: { cwd: wsSplit, id: 's-split' } } } }
+const sp = await searchTool.execute({ query: '分段检索测试', project: 'dsh', k: 10 }, splitCtx)
+const spIds = new Set(sp.hits.map((h) => h.id))
+check('search 5+5: default k=10 returns 10 hits', sp.hits.length === 10, `got ${sp.hits.length}`)
+check('search top5 blind includes seen (injected) entries', spIds.has(sid(1)) && spIds.has(sid(2)))
+check('search rank6+ skips seen entries (6,7 excluded)', !spIds.has(sid(6)) && !spIds.has(sid(7)))
+check('search blind includes this-session memory', spIds.has(sid(5)))
+check('search fresh includes this-session unseen memory', spIds.has(sid(12)))
+check('search 5+5 exact result set', JSON.stringify([...spIds].sort()) === JSON.stringify([1, 2, 3, 4, 5, 8, 9, 10, 11, 12].map(sid).sort()))
+const spSeen = readSeen(wsSplit, 's-split', '.dsh-meow')
+check('search marks all returned ids as searched', [...spIds].every((id) => spSeen.has(id)))
+// 未标记（project null）条目：能检索且输出 project=''（不触发输出校验失败）
+dbSplit.insert({ level: 'fact', content: '分段检索测试 未标记条目 特异性词u', project: null, source_session: 'win-other' })
+const spNull = await searchTool.execute({ query: '未标记条目', project: 'dsh' }, splitCtx)
+check('search unmarked row returns project=""', spNull.hits.length >= 1 && spNull.hits[0].project === '')
+// k<5：全盲取（无 fresh 段）
+const sp3 = await searchTool.execute({ query: '分段检索测试', project: 'dsh', k: 3 }, splitCtx)
+check('search k=3: blind only', sp3.hits.length === 3 && sp3.hits.some((h) => h.id === sid(1)))
+check('search description mentions 5+5 rule', searchTool.description.includes('前 5 条按相关度无脑取') && searchTool.description.includes('绕开已注入/已检索'))
+dbSplit.close()
 const readTool = tools.find((t) => t.name === 'memory_read')
 const readNotFound = readTool.output.render({}, { found: false })
 check('read not-found hints chat log', readNotFound[0].text.includes('聊天记录里搜索相关关键词'))
@@ -772,6 +823,8 @@ rmSync(ws4, { recursive: true, force: true })
 rmSync(wsUp, { recursive: true, force: true })
 rmSync(wsD, { recursive: true, force: true })
 rmSync(wsR, { recursive: true, force: true })
+rmSync(wsIcon, { recursive: true, force: true })
+rmSync(wsNoDb, { recursive: true, force: true })
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed > 0 ? 1 : 0)

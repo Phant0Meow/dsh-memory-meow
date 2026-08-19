@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.12.0 (2026-08-19)
+
+### memory_search 结果构成改版（用户拍板）
+- **5+5 分段**：默认 top 10 = 前 5 条按相关度**无脑取**（不排除任何记忆，包括已注入/已检索/本 session 建立的）+ 后 5 条从排名第 6 名起逐个往下、**绕开已见**（injected+searched）的记忆补齐——保证最相关的不被"已在上下文里"排除，同时保留新信息。
+- 旧规则「已注入/已检索过的不检索」「不检索本 session 建立的记忆」从 `memory_search` 移除（命中注入链路不变，仍去重）；k<5 时全部盲取，k>10 时前 5 盲取、其余绕开已见补齐。
+- 工具描述 / MEMORY_GUIDE / README 双语同步。
+- 顺带修：检索命中"未标记（project=null）"条目时输出校验报 `project must be a string` → 输出改 `''`（与 memory_read 一致，`projectLabel('')`=未标记）。
+
+### memory_project 必填文案强化（用户反馈 AI 常漏传 project）
+- MEMORY_GUIDE 该段改为「你要看哪个项目的信息？必须提供项目名称作为参数。」；工具 description 加必填行；首轮导引加「记得带上项目名，不能空参」；README 双语同步。
+
+### 会话列表"已 dream"小月牙图标（用户拍板）
+- 左侧会话列表中，dream 整理过记忆且之后无新对话新信息的会话行最左侧显示 10px 静态小月牙（与 dsh 状态点同尺寸/同配色体系，无动画）。**dsh 本体零改动**。
+- 数据**事件驱动无轮询**：host 新增 `/meow-memory/dream-events` SSE 长连接（dream 完成推 `dreamed:true`、会话有新活动推 `dreamed:false`）+ `/meow-memory/dreamed-sessions` 全量快照（client 挂载/断线重连时对账一次）；dream 完成判定 = windows 表 `last_dream_time` 非空且之后无活动。
+- 行定位读 React 18 fiber（`__reactFiber$` 内部属性，DevTools 同款机制）拿行渲染 key = session id——精确匹配，不依赖标题；找不到 fiber 静默降级。
+- 双实例限制：SSE 只在当前实例广播，跨实例的 dream 完成靠断线重连/挂载对账补齐。
+- 测试：`collectDreamStates`（test.mjs，dreamed/dreaming 双态）+ `readSessionId`/`applyDreamIcons`（新 tests/client-dream-icon.mjs，14 断言）。
+- 三态与视觉定稿（用户反馈迭代）：①图标改**淡黄色**，dream 进行中显示**白→金呼吸灯动画**（替换 dsh 运行中蓝色动画，避免混淆），完成后停留淡黄；②图标放进 dsh 会话行的**状态槽位**（替换槽内内容，标题零位移）；③SSE 协议扩展为 `state: dreaming/dreamed/active`，快照返回 `{ sessionIds, dreamingIds }`（活跃租约 = dream 进行中）；④路由注册挂 `ctx.effect`（热重载自动注销）+ apply 错误落盘日志。
+- **webServer 启动竞态修复**（3080 重启后实测）：fiber 并发启动时 webServer 服务可能晚于插件就绪 → 路由未注册、SPA fallback 接管（工具正常但数据路由缺失）。路由注册改为立即尝试 + 每 1s 重试（最多 20 次），dispose 清理定时器。
+
 ## v0.11.0 (2026-08-19)
 
 ### dream 两轮制改版

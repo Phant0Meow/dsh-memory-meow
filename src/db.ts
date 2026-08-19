@@ -61,10 +61,10 @@ export function projectCovers(field: string | null, name: string): boolean {
   return projectList(field).includes(name)
 }
 
-/** project 字段的展示标签：'全局'=真全局；null=未标记；多值 join '/'（如 dsh/femwa）。 */
+/** project 字段的展示标签：'全局'=真全局；null/''=未标记；多值 join '/'（如 dsh/femwa）。 */
 export function projectLabel(field: string | null): string {
   if (field === '全局') return '全局'
-  if (field === null) return '未标记'
+  if (field === null || field === '') return '未标记'
   return projectList(field).join('/')
 }
 

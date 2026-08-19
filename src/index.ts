@@ -39,6 +39,7 @@ import { buildHitInjection, buildInjection, markSearched, readInjected, releaseS
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { registerMemoryTools } from './tools.js'
+import { collectDreamStates, DreamStateBroadcast } from './dream-signal.js'
 
 export const name = 'meow-memory'
 
@@ -103,13 +104,14 @@ export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆
 【查记忆】
 
 3. 查看项目全景：memory_project
+- 你要看哪个项目的信息？必须提供项目名称作为参数。
 - 提供关于项目的全局信息，可帮助你快速了解该项目。
 - 包含设计历史、技术决策、用户原话、项目进度等。
 
 4. 检索记忆：memory_search
 - query 必填：传关键词/句子（如 "记忆插件 部署"），不要空查。
 - 返回检索元数据视图，不含原文；你可以根据关键词判断那条记忆是否与你需要的信息有关。需要某条记忆的全文用 memory_read。
-- 只检索其他会话建立的记忆；本会话已注入/已检索过的自动排除。
+- 默认 top 10 = 前 5 条按相关度取（不排除任何记忆，包括已注入/已检索/本 session 建立的）+ 后 5 条绕开已注入/已检索的记忆补齐。
 - 默认搜 fact/lesson/topic/rules；
 - 支持选择性搜索某个 level/project/status（可多选，逗号分割）。
 - 支持按时间检索，如 days: 30 = 只搜最近 30 天创建的。
@@ -301,7 +303,23 @@ function lastTurnEndReason(events: readonly unknown[]): string | null {
   return null
 }
 
+/** apply 包装：错误落盘（homedir/.dsh-meow/apply-error.log），排查 fiber 启动失败。 */
 export async function apply(ctx: Context, config: unknown): Promise<void> {
+  try {
+    return await applyInner(ctx, config)
+  } catch (e) {
+    try {
+      const errFile = join(homedir(), '.dsh-meow', 'apply-error.log')
+      mkdirSync(dirname(errFile), { recursive: true })
+      appendFileSync(errFile, `[${new Date().toISOString()}] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}\n`)
+    } catch {
+      /* 日志失败忽略 */
+    }
+    throw e
+  }
+}
+
+async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const resolved = resolveConfig(config)
   if (!resolved.enabled) {
     ctx.logger.info('meow-memory: disabled by config')
@@ -320,7 +338,11 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     const dispose = ctx.tools.register(t)
     if (typeof dispose === 'function') toolDisposers.push(dispose)
   }, resolved.projectDir)
-  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir))
+  // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
+  // 完成推 dreamed、有新活动推 active。
+  const broadcast = new DreamStateBroadcast(ctx.logger)
+  const signalDreamState = (sessionId: string, state: 'dreaming' | 'dreamed'): void => broadcast.broadcast(sessionId, state)
+  const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState))
   if (typeof disposeDreamTool === 'function') toolDisposers.push(disposeDreamTool)
   ctx.logger.info('meow-memory: memory_remember/search/read/update + memory_dream registered')
 
@@ -376,6 +398,9 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     lastWindowWrite.set(sid, now)
     const db = getDb(cwd, resolved.projectDir)
     db.touchWindow(sid, cwd, event.time)
+    // dream 状态信号：该会话有新活动 → 若曾 dream 过，推 active（去月亮；client 幂等忽略）。
+    const win = db.getWindow(sid)
+    if (win !== undefined && win.last_dream_time !== null) broadcast.broadcast(sid, 'active')
     windowIndex.set(sid, cwd)
     persistWindowIndex() // 窗口索引落盘（热重载/重启后恢复）
   })
@@ -495,11 +520,11 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
     // 用户按停止（aborted/interrupted）：不反思、不推进下一组；但 dream 轮必须立即收尾，
     // 否则 DB 租约残留，窗口要等租约过期（30min）才能再 dream。
     if (endReason === 'aborted' || endReason === 'interrupted') {
-      if (dreamTurn) abortDream(agent, resolved.projectDir)
+      if (dreamTurn) abortDream(agent, resolved.projectDir, signalDreamState)
       return
     }
     if (dreamTurn) {
-      advanceDream(agent, resolved.projectDir) // dream 轮：推进下一组或收尾（含孤儿收尾）
+      advanceDream(agent, resolved.projectDir, signalDreamState) // dream 轮：推进下一组或收尾（含孤儿收尾）
       return
     }
 
@@ -518,10 +543,66 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
   })
 
   // 3) 夜间整理（按窗口；windowIndex 记录 sessionId → workspace）。
-  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex)
+  const stopDream = scheduleDream(ctx, resolved.dream, resolved.projectDir, windowIndex, signalDreamState)
   ctx.logger.info(
     `meow-memory: dream scheduled (window ${resolved.dream.windowStart}:00-${resolved.dream.windowEnd}:00, idle ${resolved.dream.idleMinutes}m, every ${resolved.dream.checkMinutes}m)`,
   )
+
+  // 4) 会话列表"已 dream"图标数据面（仿 meow-eyes describe 路由，webServer 可选服务）：
+  //    - GET /meow-memory/dreamed-sessions：全量快照（client 挂载/重连时拉一次）；
+  //    - GET /meow-memory/dream-events：SSE 长连接，dream 完成/新活动时推送增量信号（事件驱动，无轮询）。
+  // webServer 服务可能晚于本插件就绪（fiber 并发启动竞态——实测 3080 重启后 apply 时
+  // webServer 未注册 → 路由缺失、SPA fallback 接管；热重载时代服务早已就绪无此问题）。
+  // 修复：立即尝试；未就绪则每 1s 重试（最多 20 次）；dispose 时清理定时器。
+  // 注册挂 ctx.effect：fiber dispose 时自动注销（super-injector 热重载契约——裸注册在
+  // 热重载时残留路由 → 下次 apply duplicate 报错）。
+  const routeDisposers: Array<() => void> = []
+  let routeTimer = 0
+  const tryRegisterDreamRoutes = (attempt: number): void => {
+    const ws = (ctx as { get?: (name: string) => unknown }).get?.('webServer') as
+      | { register?: (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }) => () => void }
+      | undefined
+    if (ws !== undefined && typeof ws.register === 'function') {
+      const registerOne = (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }): void => {
+        try {
+          routeDisposers.push(ctx.effect(() => ws.register(route)))
+        } catch (e) {
+          ctx.logger.warn(`meow-memory: route ${route.path} 注册失败: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+      registerOne({
+        kind: 'exact',
+        path: '/meow-memory/dreamed-sessions',
+        handler: (_req, res) => {
+          void (async () => {
+            try {
+              const sessionPersistence = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
+                | { list?: () => Promise<Array<{ id: string; cwd?: string }>> }
+                | undefined
+              const sessions = typeof sessionPersistence?.list === 'function' ? await sessionPersistence.list() : []
+              const states = collectDreamStates(sessions, resolved.projectDir)
+              writeJson(res, 200, { sessionIds: states.dreamed, dreamingIds: states.dreaming })
+            } catch (e) {
+              writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+            }
+          })()
+        },
+      })
+      registerOne({
+        kind: 'exact',
+        path: '/meow-memory/dream-events',
+        handler: (req, res) => broadcast.handle(req as never, res as never),
+      })
+      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE routes registered')
+      return
+    }
+    if (attempt < 20) {
+      routeTimer = setTimeout(() => tryRegisterDreamRoutes(attempt + 1), 1000) as unknown as number
+    } else {
+      ctx.logger.warn('meow-memory: webServer 服务 20s 内未就绪，会话列表 dream 图标数据路由未注册')
+    }
+  }
+  tryRegisterDreamRoutes(0)
 
   ctx.on('dispose', () => {
     for (const dispose of toolDisposers) {
@@ -531,9 +612,33 @@ export async function apply(ctx: Context, config: unknown): Promise<void> {
         /* 注销失败不阻塞 */
       }
     }
+    for (const dispose of routeDisposers) {
+      try {
+        dispose()
+      } catch {
+        /* 注销失败不阻塞 */
+      }
+    }
+    clearTimeout(routeTimer)
     stopDream()
-    closeAllDbs()
+    broadcast.dispose()
+    try {
+      closeAllDbs()
+    } catch {
+      /* 关库失败不阻塞清理链 */
+    }
   })
+}
+
+/** 统一 JSON 响应（路由用）。 */
+function writeJson(res: unknown, status: number, body: unknown): void {
+  try {
+    const r = res as { writeHead?: (code: number, headers: Record<string, string>) => void; end?: (chunk?: string) => void }
+    r.writeHead?.(status, { 'content-type': 'application/json' })
+    r.end?.(JSON.stringify(body))
+  } catch {
+    /* 响应失败不抛 */
+  }
 }
 
 // ── 模块级窗口索引（sessionId → workspace） ────────────────────────────────
@@ -590,6 +695,7 @@ function persistWindowIndex(): void {
 
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
+export { collectDreamStates } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
