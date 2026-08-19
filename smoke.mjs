@@ -97,33 +97,33 @@ const n2 = migrateLegacy(db2, ws2)
 check('migrate idempotent', n2 === null)
 
 // ── inject（需要 sessions/ 去重与命中注入）─────────────────────────────────
-const { buildInjection } = await import('./lib/index.js')
+const { buildInjection, buildHitInjection, setCurrentProject } = await import('./lib/index.js')
 db2.insert({ level: 'fact', content: '3081 端口是喵版 dsh', project: 'dsh', created_at: Date.now() })
 db2.insert({ level: 'soul', content: '我是用户的长期协作伙伴。', created_at: Date.now() })
 const inj = buildInjection(db2, ws2, 'test-session-1', '3081 现在什么状态？', { hitTopK: 3 }, '.dsh-meow')
 check('injection produced', inj !== null)
 if (inj) {
-  check('injection has soul block', inj.text.includes('【soul 核心】'))
-  check('injection has user block', inj.text.includes('【user 偏好】'))
-  check('injection has guide', inj.text.includes('【记忆导引】') && inj.text.includes('project:femwa'))
-  check('injection has keyword hits', inj.text.includes('【相关记忆】') && inj.text.includes('3081 端口是喵版 dsh'))
-  check('injection format', inj.text.includes('=====记忆结束=====') && inj.text.includes('【本轮用户输入】：'))
+  check('injection has soul block', inj.text.includes('【关于你】'))
+  check('injection has user block', inj.text.includes('【关于user】'))
+  check('injection has guide', inj.text.includes('【记忆导引】') && inj.text.includes('用户的所有 project：'))
+  check('injection format', inj.text.includes('===== 长期记忆结束 =====') && inj.text.includes('本轮用户prompt：'))
   check('injected ids recorded', readFileSync(join(ws2, '.dsh-meow', 'sessions', 'test-session-1.json'), 'utf8').includes(inj.injectedIds[0]))
 }
 // 已注入过的命中不再重复注入
 const inj2 = buildInjection(db2, ws2, 'test-session-1', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
 check('dedup across sessions file', inj2 === null || !inj2.text.includes('3081 端口是喵版 dsh'))
-// 新 session 不受影响
-const inj3 = buildInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
+// 命中链路（独立于首轮注入）：新 session 命中
+setCurrentProject(ws2, 'test-session-2', 'dsh', '.dsh-meow')
+const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
 check('new session gets hits', inj3 !== null && inj3.text.includes('3081 端口是喵版 dsh'))
 
 // ── reflect 消息 ───────────────────────────────────────────────────────────
 const { buildReflectMessage } = await import('./lib/index.js')
 const db3 = new MemoryDb(memoryDbPath(ws))
 const msg = buildReflectMessage(ws, '我们讨论一下猫眼插件的模型部署', '.dsh-meow')
-check('reflect message produced', msg.content.some((b) => b.type === 'text' && b.text.includes('[记忆反思]')))
+check('reflect message produced', msg.content.some((b) => b.type === 'text' && b.text.includes('[meow-memory-reflect] 记忆反思任务')))
 const txt = msg.content.map((b) => b.text ?? '').join('')
-check('reflect has topic rules', txt.includes('目标句') && txt.includes('宽泛名'))
+check('reflect has new-format sections', txt.includes('【一】') && txt.includes('【三】') && txt.includes('8-13'))
 
 db.close(); db2.close(); db3.close()
 closeAllDbs()

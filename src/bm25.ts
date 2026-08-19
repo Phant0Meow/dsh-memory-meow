@@ -78,6 +78,7 @@ export interface RankedHit {
   title: string | null
   content: string
   importance: number
+  updated_at: number
   score: number
 }
 
@@ -144,6 +145,7 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
       title: docs[di].title,
       content: docs[di].content,
       importance: docs[di].importance,
+      updated_at: docs[di].updated_at,
       score: raw[di] * w,
     })
   }
@@ -215,6 +217,7 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
       title: docs[di].title,
       content: docs[di].content,
       importance: docs[di].importance,
+      updated_at: docs[di].updated_at,
       score: raw[di] * coverage * w * impW * (titleHit ? 1.2 : 1),
     })
   }

@@ -4,15 +4,12 @@
  * 触发：一次任务（单个 turn）内连续 react（工具）step ≥ reflectTurns（默认 7）
  * 后，在该轮结束时触发一次；单次简单工具调用不触发。顶层会话、本 turn 未反思过、
  * 最后工具非 memory_ 系列。
- * 反思消息三块：
- *   1) 记忆清单（fact/lesson 短条目、原话保留、project/topic 规则）；
- *   2) 话题偏离信号（keyword 聚类余弦，只提醒不拍板）；
- *   3) 最相关 topic 当前版本底稿（模型重写前先看它，防无底稿覆盖）。
+ * 反思消息（用户拍板 2026-08-19 终稿）：【一】新记忆（project 列表/纠正/偏好等）、
+ * 【二】更新判断（过时/错误/完成/关键词不准反推）、【三】通用要求（subcategory/
+ * 关键词 8-13/importance/收尾）。topic 归 dream 轮处理，反思不再涉及。
  */
 
 import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
-import type { Doc } from './bm25.js'
-import { topicDrift } from './bm25.js'
 import { getDb } from './db.js'
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
@@ -101,74 +98,44 @@ export function consecutiveToolSteps(events: readonly unknown[]): number {
   return best
 }
 
-const BASE_PROMPT = [
-  '[记忆反思]',
-  '从上次整理记忆到现在，中间这么多轮次里，有值得跨会话记住的新记忆吗？',
-  '有变更的信息要及时更新：是否有哪条记忆，你非常确定它的信息已经过时了（比如由用户亲口否定或改变）？你应该更新它，不要放着不管。',
-  '已经完成、过时的任务要标记状态：todo（进行中事项）完成 → 标 stale（视为 done）；话题达成目标完结 → 标 stale；确认删除的条目（过时作废、重复、被替代）→ 标 archived（删除）。其他情况保持 active 不改标。',
-  '如果有，按需调用 memory_remember / memory_update；没有则回复"无需记忆"。',
-  '',
-  '【一】添加记忆条目',
-  '如存在以下情况，你可以酌情添加记忆条目：',
-  '- 用户的交流/工作/代码偏好（user）；项目特定偏好进 project。',
-  '- 设计原则/行为准则（rules）：全局准则不填 project 且 importance≥2（会全量注入首轮）；项目特定准则填 project（随 memory_project 注入）；用户介绍设计思路/框架/决策理由的原话必须保留措辞，进 rules 或 lesson；',
-  '- 项目相关的关键信息（project：必须给项目名）。project 子标签（subcategory）：',
-  '  overview=项目目标概述 / structure=项目结构 / decisions=技术决策 /',
-  '  quotes=用户原话 / ops=部署与数据 / todo=进行中事项（todo 完成时标 stale 视为 done）。',
-  '- 用户介绍项目设计思路、框架、决策理由时说的话——必须保留用户原话措辞，不要转述总结（进 project 或 lesson）；',
-  '- 重要的事实、结论或决定（fact：一句话直陈，≤60 字）；',
-  '- 犯过的错、被用户纠正的地方、多次尝试才成功的经验、踩过的坑（lesson，被纠正的一定要记，保留用户原话和 corrected 标记）；',
-  '- 写记忆时，总结完记忆内容后，同时总结这段记忆的关键词（提取 5-10 个内容词，如"记忆插件"；别提取"好的""这个"等虚词），随 memory_remember 的 keywords 参数一起提交。',
-  '',
-  '【二】总结话题进展',
-  '如果你们正在讨论的话题有了新的进展、新的事实、新的发展经过结果，你可以更新话题描述。',
-  '话题 topic 规则：',
-  '- topic 创建/更新时必须带 project 参数（所属项目名，见会话开头导引中的项目列表）。',
-  '- 一条 topic = 一个正在进行或刚结束的讨论线索，可跨会话持续。',
-  '- 创建时用 memory_remember 写目标句（goal）与名词性标题（对象+动作，如「femGen 集成」；禁止宽泛名如"dsh 插件"）。',
-  '- 归属判断：本 turn 是否让已有 topic 的目标句更接近一步？是 → memory_update 重写该 topic（【起因经过发展结果】≤300 字，旧的没价值信息可丢弃）；否（与目标无因果关联的独立事项）→ 新建 topic。',
-  '- 状态标记：话题达成目标完结 → 标 stale；确认删除的话题（不再需要）→ 标 archived（删除）；久无进展不改标。',
-  '',
-  '注意：memory_remember / memory_update 调用成功后即完成，不要重复调用。',
-  '如果没有值得记住的，直接回复"无需记忆"即可，不要调用任何工具。',
-].join('\n')
-
-function formatTopicDraft(t: { title: string | null; goal: string | null; content: string; id: string }): string {
-  const parts = [`话题「${t.title ?? '(无标题)'}」当前版本（id=${t.id.slice(0, 8)}）：`]
-  if (t.goal) parts.push(`目标：${t.goal}`)
-  parts.push(t.content)
-  return parts.join('\n')
+function buildBasePrompt(projectNames: string[]): string {
+  const projectList = projectNames.length > 0 ? projectNames.join(' / ') : '（暂无）'
+  return [
+    '记忆反思任务',
+    '请回顾你的聊天历史。',
+    '',
+    '【一】从上次【记忆反思任务】，到现在，中间这么多轮次里，有值得跨会话记住的新记忆吗？使用memory_remember添加新记忆条目。',
+    `1. 当前记忆库中已有的 project：${projectList}。你认为是否有新的 project 需要添加？ → 请添加新 project 的记忆。`,
+    '2. 你是否记错、说错、想错了什么、是否被用户纠正过？',
+    '- 被用户纠正的一定要记，加入你认为合适的记忆层级（如project，rule，fact等）。',
+    '- 如果是写入 lesson层级，需保留 corrected 标记；',
+    '3. 如存在以下情况，你可以酌情添加记忆条目：',
+    '- 用户是否提出了交流/工作/代码偏好 → 全局偏好记录进user；项目特定偏好进 project。',
+    '- 用户是否提出了某些设计原则/行为准则？ → 记录进rules。',
+    '- 有没有用户介绍项目设计思路、框架、决策理由时说的话？ → 保留用户原话，记录进正确的层级。',
+    '- 有没有重要的事实、结论或决定？',
+    '- 你是否在完成任务的过程中踩过坑，有没有多次尝试才成功的时候？如果你认为值得记录，可作为lesson记录。',
+    '',
+    '【二】回看上下文中注入的所有记忆，结合你的最新进展，请你判断，是否有需要更新的记忆？',
+    '1. 是否有哪条记忆，你现在非常确定它的信息已经过时了（比如由用户亲口否定或改变主意）？ → 你应该及时更新它的内容，不要放着不管。',
+    '2. 你是否发现有哪条记忆信息是错的，甚至误导了你？ → 更新为正确信息，或者标 archived（视为 delete）；',
+    '3. 是否有哪些todo或topic已被完成？ → 标 stale（视为 done）；',
+    '4. 你是否发现有那条记忆注入时机非常不合理，和当前任务一点关系也没有？→ 这是因为关键词不准，更新它的关键词；',
+    '',
+    '【三】写记忆时的通用要求',
+    '1. 写记忆的规则见系统提示词。你应该把记忆归类在正确的level和标签之下。',
+    '2. 强调一下关键词拟定标准:',
+    '- 提取 8-13 个关键词供检索',
+    '- 反向思考："在用户prompt提及哪些词的时候，你希望这条记忆能被检索到？"',
+    '- 非项目名，针对记忆本身的细节。',
+    '- 优先提取核心实体、语义中心、专有名词。',
+    '3. 如果你认为没有什么重要信息，不需要添加和更新记忆，直接回复"无需记忆"即可，不要调用任何工具。',
+  ].join('\n')
 }
 
 export function buildReflectMessage(workspace: string, turnText: string, dir = '.dsh-meow'): ReturnType<typeof createUserMessage> {
   const db = getDb(workspace, dir)
-  const topics = db.list('topic', { status: 'active' })
-  const drift = topicDrift(
-    turnText,
-    topics.map((t) => ({
-      id: t.id,
-      level: 'topic',
-      title: t.title,
-      content: t.content,
-      keywords: t.keywords,
-      importance: t.importance,
-      created_at: t.created_at,
-    })) as Doc[],
-  )
-
-  const blocks: string[] = [REFLECT_MARKER, BASE_PROMPT]
-  if (drift.suggestsNew) {
-    blocks.push(
-      '',
-      `[关键词偏离提示] 本 turn 与现有话题「${drift.topTopic?.title ?? '?'}」的相似度仅 ${drift.topScore.toFixed(2)}，` +
-        '疑似切换到了新话题/子话题。请用上面的目标句规则判断：仍在推进旧话题目标 → 归旧话题；否则新建 topic。',
-    )
-  }
-  if (drift.topTopic) {
-    const t = topics.find((x) => x.id === drift.topTopic!.id)
-    if (t) blocks.push('', '【相关话题底稿】（重写前先读它，不要凭记忆覆盖）', formatTopicDraft(t))
-  }
-  const text = blocks.join('\n')
+  const text = `${REFLECT_MARKER} ${buildBasePrompt(db.listProjectNames())}`
   return createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE })
 }
 

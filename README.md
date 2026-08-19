@@ -7,12 +7,12 @@
 
 
 **核心理念**：每个工作区维护一份结构化记忆数据库（`.dsh-meow/memory.db`，基于 `node:sqlite`）。
-静态工具手册（七层结构 + 每个 `memory_*` 工具的用法）以固定 section 的形式放在 **system prompt** 里——
+静态记忆手册（数据总览 + 工具用法 + 写作准则）以固定 section 的形式放在 **system prompt** 里——
 文本恒定，因此不会破坏 LLM provider 的 KV/上下文缓存。动态内容（soul/user 全量、设计原则、
 记忆导引）作为**第一条用户消息的前缀**注入，且首轮只注入长期记忆、不做关键词命中；
 从第二轮起每条用户消息做关键词命中（top-2）。模型按需用 `memory_search` /
-`memory_project` 深入检索。每个窗口由自己的主 agent 在夜间（"dream"）整理记忆，
-且只整理自己的记忆——以窗口最后一次对话时间戳冻结其知识。
+`memory_project` 深入检索。每个窗口由自己的主 agent 在夜间（"dream"）整理记忆
+（本窗口建立 + 提取过的记忆），以窗口最后一次对话时间戳冻结其知识。
 
 ## ✨ 功能特性
 
@@ -38,18 +38,25 @@
   在 system prompt 中注册一次——文本恒定，KV 缓存友好。已见记忆（`injected` + `searched`）
   按会话记录（`.dsh-meow/sessions/<id>.json`），绝不重复注入或重复检索；收到会话压缩
   信号（`compaction/*`）时释放已见记录，允许压缩后被再次命中提取。
-- **工具集**：`memory_remember`（写入，自动去重合并，返回读回确认：关键词/项目归属；
-  支持 keywords 参数——反思/dream 轮由 LLM 总结 5-10 个内容词，不传则自动 bigram 提取）/
-  `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，按记忆时间戳排序）/
-  `memory_project`（项目全景注入段落：按子标签分组、未过时条目全给、todo 输出
-  「已完成：」最近 5 条 +「To do list：」，末尾附记忆库与会话历史定位说明）/
+- **工具集**：`memory_remember`（写入，必填 content/project/keywords/importance 且缺失报错引导重填，
+  自动去重合并，返回读回确认：关键词/项目归属）/
+  `memory_search`（BM25 × 近期权重，支持 level/project/status/days 过滤，按记忆时间戳排序；
+  返回检索元数据视图：归属 + 完整 id + 相对时间 + 关键词列表，不含原文）/
+  `memory_project`（项目全景注入段落：按子标签分组、未过时条目全给、每条带完整 id 与
+  最后更新时间戳、todo 输出「已完成：」最近 5 条 +「To do list：」，末尾附记忆库与
+  会话历史定位说明）/
   `memory_find_similar`（查重与冲突检测）/ `memory_read` / `memory_update`（含 status
   active/archived/stale、importance、goal、keywords 手动修正）/ `memory_dream`（手动触发）。
 - **记忆时间戳**（`updated_at` = 最后更新时间）：dream 封存或 `memory_update` 刷新时更新。
-  搜索结果按它重排，命中/注入带相对时间（如「2 天前」），并带"冲突 → 最新为准"提示。
+  展示的时间戳一律是 `updated_at`；search（工作视图）带相对时间戳，命中注入/memory_project
+  （原文视图）带相对 + 绝对时间戳（如「2026-08-15 10:58 [2 天前]」）。
+- **project 归属**：全局适用的信息 project 填 `"全局"`（与留空=未标记区分）；同时适用于
+  多个项目时用英文逗号分隔（如 `"dsh, femwa"`）——检索/命中按"包含当前项目名 或 全局"判定。
 - **按窗口 dream**：夜间（按 `timeZone` 计算，默认 00:00–07:00，空闲时）每个最后发言
-  晚于上次 dream 的窗口由自己的主 agent 整理——每个项目一组、一轮一组——使用其完整
-  会话上下文。无 live agent 且超过 24h 的旧窗口、以及已归档的会话，均不处理。
+  晚于上次 dream 的窗口由自己的主 agent 整理——分两轮（第 1 轮原子记忆
+  project/fact/lesson/rules/soul/user，第 2 轮 topic 记忆），project 小标题分段，
+  每条记忆附关键词行（AI 核查/重写关键词用），范围=本窗口建立 + 提取过的记忆，
+  使用其完整会话上下文。无 live agent 且超过 24h 的旧窗口、以及已归档的会话，均不处理。
 - **反思**：单次任务内连续 ≥7 个工具 step 后，插件询问模型自上次整理以来是否有值得记忆的内容。
   最后工具是 `memory_*` 视为已主动记忆、不重复反思；被取消的轮次绝不触发。
 - **注入折叠 UI（client 端）**：首轮长期记忆 / 每消息关键词命中的注入文本在前端
@@ -122,9 +129,9 @@ npm install meow-memory
 第一条用户消息（首轮）         第二条起的每条消息                夜间
 ┌────────────────────┐        ┌────────────────────┐        ┌──────────────────────┐
 │ ===== 长期记忆 ===== │        │ 可能相关的记忆，仅供  │        │ 按窗口 dream：        │
-│ 【关于你】(soul)     │        │ 参考：keywords 命中   │        │ 自己的记忆，按项目分组 │
-│ 【关于user】         │        │ top-2（全局+当前     │        │ 一轮一组，updated_at   │
-│ 【设计原则】(rules)   │        │ project 锚定）      │        │ 以 T 封存             │
+│ 【关于你】(soul)     │        │ 参考：keywords 命中   │        │ 两轮（原子/topic）    │
+│ 【关于user】         │        │ top-2（全局+当前     │        │ 七层+提取过的，       │
+│ 【设计原则】(rules)   │        │ project 锚定）      │        │ updated_at 以 T 封存  │
 │ 【记忆导引】          │        └────────────────────┘        └──────────────────────┘
 │ ─────────────      │        已见 id 按会话记录
 │ 本轮用户prompt：     │        (sessions/<id>.json)
@@ -139,7 +146,7 @@ npm install meow-memory
 ```sh
 npm install
 npm run build          # esbuild 打包 → lib/index.js（自包含）
-npm run test           # 144 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run test           # 196 项逻辑测试：db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace 中，不在本包的 `node_modules` 里。

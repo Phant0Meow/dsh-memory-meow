@@ -9,10 +9,12 @@
  * - 去重：.dsh-meow/sessions/<sessionId>.json 记录本会话注入过的 memory id。
  * - 工具：memory_remember / memory_search / memory_read / memory_update
  *   + memory_dream（手动整理本窗口）。
- * - 反思：干过活的 turn 结束后引导模型记忆；topic 用目标句规则归属，
- *   关键词偏离信号只提醒不拍板，重写附底稿。
- * - dream：按窗口夜间整理——每个窗口由自己的主 agent 整理自己建立的记忆，
- *   按 project 分组逐轮，updated_at 封存（"记忆时间戳"=最后更新时间）；串行；旧窗口不碰。
+ * - 反思：干过活的 turn 结束后引导模型记忆——【一】新记忆（project 列表/纠正/偏好）、
+ *   【二】更新判断（含关键词不准反推）、【三】通用要求（subcategory/关键词 8-13/importance）；
+ *   topic 归 dream 轮处理（用户拍板 2026-08-19）。
+ * - dream：按窗口夜间整理——每个窗口由自己的主 agent 整理自己建立/提取过的记忆，
+ *   分两轮（原子记忆 project/fact/lesson → topic 记忆），project 小标题分段；
+ *   updated_at 封存（"记忆时间戳"=最后更新时间）；串行；旧窗口不碰。
  * - 迁移：首次打开库时把旧 PROJECT.md 导入 SQLite，文件改名 .imported 留底。
  */
 
@@ -49,25 +51,123 @@ export const inject = ['tools']
  * 文本恒定、不随会话变化 → 前缀稳定，KV 缓存友好；动态记忆内容（soul/user/
  * 导引/命中）仍走首条消息注入。文案与 tools.ts 的工具 schema 保持一致。
  */
-export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆（SQLite 七层：soul=AI自身 / user=用户偏好 /
-project=项目（含子类 overview/structure/decisions/quotes/ops/todo）/ fact=原子事实 /
-lesson=教训 / topic=话题 / rules=设计原则与行为准则）。记忆按"记忆时间戳"排序，冲突以最新为准，旧的可作过程参考。
-工具：
-- memory_remember —— 写记忆。必填 content；level 选层（默认 fact）；project 记项目名
-  （femwa/meow-memory/meow-eyes/dsh…，level=project 必填）；fact/lesson 一句话 ≤60 字；
-  rules=设计原则/行为准则：全局准则不填 project 且 importance≥2（会全量注入首轮），项目特定准则填 project；
-  topic 需 title（建议配 goal 目标句与 project 项目名）；用户介绍设计思路/框架/决策理由的原话必须保留措辞不转述；
-  写前可先 memory_find_similar 查重。
-- memory_search —— 检索（query 必填且不能为空：传关键词/句子，如 "记忆插件 部署"；
-  浏览项目全貌用 memory_project，不要空 query 调本工具）。只返回其他会话建立的记忆
-  （本会话已注入/已检索的自动排除）；默认搜 fact/lesson/topic/rules；支持 level 逗号
-  多选、project/status/days 过滤；k 1-50。
-- memory_project —— 当你需要全面了解某个项目的整体概述、设计历史、技术决策、用户原话或进度时使用。
-- memory_find_similar —— 按 id 找内容相似条目（查重/找冲突用）。
-- memory_read —— 读完整条目（含元数据）。
-- memory_update —— 改条目（content/status 含 stale=完结（todo 完成、话题达成目标 → stale）；
-  archived=删除；importance/goal/project/subcategory/keywords（手动修正关键词，默认自动提取））。
-- memory_dream —— 立即整理本窗口记忆（通常夜间自动）。`
+export const MEMORY_GUIDE = `【记忆系统】meow-memory 提供跨会话记忆
+
+一、记忆数据总览
+1. 记忆level分类：
+- soul = 关于 AI 自身；
+- user = 用户基本信息、基础偏好、重要的设备网络环境、关于用户本人的重要的事；每session注入，所以不要太冗杂，只记最重要的。
+- rules = 设计原则/行为准则。全局准则 project 填"全局"，项目特定准则填 project 参数；
+- fact = 细碎的小事实（一句话直陈 ≤60 字）；
+- lesson = 错误与教训，踩过的坑，你从实践中学到的经验；
+- topic = 话题，描述一件事的前因后果、发展脉络，为AI提供更全局的、事件发展的视野。在事情有发展变化时可更新。
+- project = 项目，project记忆含子类：
+  overview：项目的目的、总览、元信息、概括信息、基础介绍存入这里。
+  structure：项目架构相关的信息存入这里。
+  decisions：重要的设计决策存入这里。
+  quotes：你认为重要的用户原话存入这里。
+  ops：部署与数据相关的信息存入这里（端口/路径/启动方式/数据库位置/运维操作）。
+  todo：你和用户的to do list，你认为即将要做的任务，记入这里。
+
+2. 记忆结构与要求：
+- 记忆都是分条目存入数据库，每条记忆不可过长（topic记忆除外）。
+- 每条记忆应聚焦于一件事或一个事实。如果事实繁多，应分为多条记忆。
+- 每条记忆必须要有关键词。
+- topic记忆是特殊的一类，可以稍长，但也是聚焦于一件事，不可以很多事件混在一起。
+- 发现某条记忆涉及信息太多，应主动将其拆分。
+- 记忆库中的记忆应时刻保持最新状态，如果事实状态、项目状态已更新，应及时更新记忆内容，或者修改记忆状态。
+
+3. 记忆注入说明
+- 你会时常收到相关记忆的自动注入（首轮长期记忆 + 每消息关键词命中），无需操作；
+- 注入的记忆仅供参考：
+   它可能与当前任务相关，也可能无关——若发现注入与当前话题无关，通常是该记忆关键词不准，可更新它。
+   它可能准确，也可能过时或错漏——若发现记忆内容有错漏、与事实不符、或已过时，请务必及时更新。
+- 记忆按"最后更新时间戳"排序，冲突以最新为准，旧的可作过程参考。
+
+
+二、你能用的记忆工具：
+
+【写记忆】
+
+1. 添加新记忆：memory_remember
+- 必填参数：content（内容）/ project/ keywords（8-13 个检索关键词）/ importance（重要性评估）。
+- 与已有条目高度重复应该用update合并，更新而非新增。
+- 已有条目信息太多需要拆解，可以用memory_remember新增条目。
+
+2. 更新已有记忆条目：memory_update
+- 必须有记忆 id 来准确指向某条记忆。
+- 如果你觉得 keywords/content/project/importance/status 信息不对，可用对应参数更新它。
+- 一次 update 可使用多个参数修改多项。
+- 参数按需，如果你不想改某一项，就不带那个参数。
+
+【查记忆】
+
+3. 查看项目全景：memory_project
+- 提供关于项目的全局信息，可帮助你快速了解该项目。
+- 包含设计历史、技术决策、用户原话、项目进度等。
+
+4. 检索记忆：memory_search
+- query 必填：传关键词/句子（如 "记忆插件 部署"），不要空查。
+- 返回检索元数据视图，不含原文；你可以根据关键词判断那条记忆是否与你需要的信息有关。需要某条记忆的全文用 memory_read。
+- 只检索其他会话建立的记忆；本会话已注入/已检索过的自动排除。
+- 默认搜 fact/lesson/topic/rules；
+- 支持选择性搜索某个 level/project/status（可多选，逗号分割）。
+- 支持按时间检索，如 days: 30 = 只搜最近 30 天创建的。
+- 默认top k = 10，但可选择 k = 1-50。
+
+5. 读取单条记忆：memory_read
+- 按记忆 id 读完整内容（含 keywords/importance/状态等元数据）。
+
+6. 查重/找冲突：memory_find_similar
+- 按记忆 id 找内容相似条目。
+
+7. 可搜索源文件
+- 记忆数据存为 SQLite（路径具体见 memory_project 返回末尾说明）；memory_search 不好用时也可直接检索数据库。
+- 记忆库里找不到时可直接搜聊天记录原文。
+  聊天记录原文：$DSH_HOME/sessions/<工作区>/<会话id>/session.jsonl.zstd——Zstandard 压缩的 JSONL；
+  用 Node ≥22.13 的 node:zlib 一行解压搜索：
+  node -e "console.log(require('node:zlib').zstdDecompressSync(require('fs').readFileSync(process.argv[1])).toString())" <文件>
+- 尤其是，当用户问及细节信息，记忆搜不到，就参考用户描述和记忆里搜到的相关线索，直接去搜聊天记录原文。
+
+【整理记忆】
+
+8. 整理本窗口记忆：memory_dream
+- 一般夜间自动触发，也可以手动调用。
+
+
+三、记忆写作准则（新建和更新记忆时都必须遵守）：
+1. content 准则
+- 不要太长，如果过长就分为多条记录。
+- 信息密度要大，不要啰嗦。
+- 如果用户提供了项目描述，应尽量保留用户原话——原话里包含用户的潜在逻辑，很珍贵。
+- 时刻保持最新，如发现错误或过时，应立即修改内容或归档。不可以允许错误或过时的记忆内容保持 active 状态。
+
+2. keywords 准则
+- 你要明白，关键词是供记忆系统检索用的，当用户 prompt 命中某条记忆的关键词，它就会被提取。
+- 所以你需要反向思考，"你希望在用户 prompt 提及哪些词的时候，这条记忆被检索到？"以此作为关键词的写入标准。
+- 每个记忆条目，提取 8-13 个关键词供检索。
+- 不要用项目名当关键词，用更加针对这条记忆本身的信息作为关键词。
+- 优先提取核心实体、语义中心、专有名词。
+- 如果某条记忆被注入的时机不合理，和你们聊的事完全无关，那应该是关键词总结的不好。你可以更新它。
+
+3. importance 准则
+- 非常重要、致命、犯错会很糟糕的决策/红线/教训，和健康、安全相关的准则 → 4；
+- 用户强调的，用户认为重要的，全局适用的准则，全局适用的通用信息 → 3；
+- 用户决策，跨越多个文件不好核实的抽象总结 → 2；
+- 琐碎的原子信息，适用性不广的信息，一些小信息想随手记一笔 → 1。
+
+4. status 准则
+- 新建记忆默认 active 状态。memory_update 可修改 status。
+- stale=完结（todo 完成 → stale 视为 done）；
+- archived=删除（过时信息、作废、重复、被替代的旧版本）；
+- 其他情况保持 active 不改标。
+
+5. project 准则
+- 如果用户在和你说一个全新的项目，你要建立新 project。
+- 如果是适用于某一个具体的项目的信息，你要在 remember 时写入该 project 名。
+- 如果是全局适用的信息，不局限于任何一个项目，project 填"全局"。
+- 如果并非适用于全局，但有多个项目都适用这一条信息，project 用英文逗号分隔多个项目名（如 "dsh, femwa"）。
+- 如果你认为某条记忆的 project 信息写错了，或者写的不全，应该及时更新它。`
 
 // ── 性能诊断（perf.log，固定位置 ~/.dsh-meow/perf.log；卡死时查数据） ────────
 // 模块级计数器：模块只初始化一次；apply 每次执行 +1——若日志里 apply 编号异常
@@ -490,9 +590,9 @@ function persistWindowIndex(): void {
 
 // re-export 供测试/调试/其他插件
 export { PLUGIN_SOURCE, REFLECT_MARKER }
-export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, closeAllDbs, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, readSeen, markSearched, readInjected, markInjected, sessionsFile, getCurrentProject, setCurrentProject } from './inject.js'
 export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
 export { tokenize, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
-export { groupWindowMemories, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, startWindowDream, advanceDream, abortDream, recoverInterruptedDream } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, startWindowDream, advanceDream, abortDream, recoverInterruptedDream } from './dream.js'

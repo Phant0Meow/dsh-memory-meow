@@ -13,8 +13,8 @@ principles, memory guide) is injected as a **prefix of the first user message**,
 first turn injects long-term memory only — no keyword hits. From the second user message
 on, every message gets a keyword hit (top-2). The model deep-dives into the rest on demand
 with `memory_search` / `memory_project`. Each window's own agent consolidates its memories
-at night ("dream"), and only its own memories — with the window's knowledge frozen at the
-last conversation timestamp.
+at night ("dream") — memories it created plus ones it was shown — with the window's knowledge
+frozen at the last conversation timestamp.
 
 ## ✨ Features
 
@@ -56,12 +56,17 @@ last conversation timestamp.
   `memory_read` / `memory_update` (incl. status active/archived/stale, importance, goal,
   manual keyword fixes) / `memory_dream` (manual trigger).
 - **Memory timestamp** (`updated_at` = last update time): refreshed by dream stamping or
-  any `memory_update`. Search results are re-ordered by it, hits/injections show relative
-  time (e.g. "2 days ago"), with a "conflict → newest wins" hint.
+  any `memory_update`. Displayed timestamps are always `updated_at`; search (work view) shows
+  relative time, hit-injection / memory_project (full-text view) show relative + absolute
+  (e.g. "2026-08-15 10:58 [2 days ago]").
+- **Project attribution**: global info gets `project: "全局"` (distinct from blank = unmarked);
+  multi-project info uses comma-separated names (e.g. `"dsh, femwa"`) — search/hits match
+  "contains current project name OR global".
 - **Per-window dream**: at night (00:00–07:00 in the configured `timeZone`, default
   Asia/Shanghai, idle) every window whose last chat is newer than its last dream gets
-  consolidated by its own main agent — one project group per turn — using its full
-  conversation context. Old windows (no live agent, >24h) and archived sessions are left
+  consolidated by its own main agent — two rounds (atomic: project/fact/lesson/rules/soul/user,
+  then topic), project sub-headings, memories it created plus ones it was shown — using its
+  full conversation context. Old windows (no live agent, >24h) and archived sessions are left
   alone.
 - **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the
   model whether anything since the last consolidation is worth remembering. A turn whose
@@ -140,9 +145,9 @@ All fields are optional (profile patch or `cordis.patch.yml`):
 First user message (turn 1)      Every message from turn 2            night
 ┌────────────────────┐          ┌────────────────────┐        ┌──────────────────────┐
 │ ===== 长期记忆 ===== │          │ 可能相关的记忆，仅供  │        │ per-window dream:     │
-│ 【关于你】(soul)     │          │ 参考：keyword hits    │        │ own memories, grouped │
-│ 【关于user】         │          │ top-2 (global +     │        │ by project, one group │
-│ 【设计原则】(rules)   │          │ current-project     │        │ per turn, updated_at  │
+│ 【关于你】(soul)     │          │ 参考：keyword hits    │        │ two rounds (atomic/   │
+│ 【关于user】         │          │ top-2 (global +     │        │ topic), 7 layers +    │
+│ 【设计原则】(rules)   │          │ current-project     │        │ extracted, updated_at │
 │ 【记忆导引】          │          │ anchor)            │        │ stamped at T          │
 │ ─────────────      │          └────────────────────┘        └──────────────────────┘
 │ 本轮用户prompt：     │          seen ids recorded
@@ -157,7 +162,7 @@ First user message (turn 1)      Every message from turn 2            night
 ```sh
 npm install
 npm run build          # esbuild bundle → lib/index.js (self-contained)
-npm run test           # 144 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run test           # 196 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
 ```
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's

@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
-import { relativeTime, type MemoryDb, type MemoryRow } from './db.js'
+import { projectCovers, projectLabel, relativeTime, type MemoryDb, type MemoryRow } from './db.js'
 
 export interface InjectOptions {
   /** 关键词命中条数上限（fact/lesson 短条目）。 */
@@ -206,7 +206,7 @@ function hitQuery(
     ...db.list('rules', { status: 'active' }),
     ...db.list('topic', { status: 'active' }),
   ].filter((r) =>
-    (r.project === null || (currentProject !== null && r.project === currentProject))
+    (r.project === null || r.project === '全局' || (currentProject !== null && projectCovers(r.project, currentProject)))
     && r.source_session !== sessionId, // 本 session 建立的记忆在上下文里，不命中
   )
   if (hitRows.length === 0) return []
@@ -224,7 +224,7 @@ function hitQuery(
     .filter((h) => !readInjected(workspace, sessionId, dir).includes(h.id))
     .map((h) => {
       const row = byId.get(h.id)
-      return { id: h.id, level: h.level, content: row?.content ?? h.content, updated_at: row?.updated_at ?? null }
+      return { id: h.id, level: h.level, content: row?.content ?? h.content, project: row?.project ?? null, updated_at: row?.updated_at ?? null }
     })
 }
 
@@ -249,9 +249,12 @@ export function buildHitInjection(
   if (fresh.length === 0) return null
   const lines = ['可能相关的记忆，仅供参考：']
   for (const h of fresh) {
-    // 时间信息：记忆时间戳（updated_at=最后更新时间）的相对时间；从未更新（null）不显示。
-    const time = h.updated_at !== null ? ` ${relativeTime(h.updated_at)}` : ''
-    lines.push(`- [${h.level}:${h.id.slice(0, 8)}]${time}`)
+    // 原文视图：归属 + 完整 id + 绝对/相对时间戳（记忆时间戳=updated_at 最后更新时间；无时间戳不显示），第二行完整内容。
+    const proj = projectLabel(h.project)
+    const time = h.updated_at
+      ? ` ${new Date(h.updated_at).toISOString().slice(0, 16).replace('T', ' ')} [${relativeTime(h.updated_at)}]`
+      : ''
+    lines.push(`[${proj} : ${h.level}] [${h.id}]${time}`)
     lines.push(h.content)
     lines.push('')
   }

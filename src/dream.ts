@@ -1,11 +1,15 @@
 /**
  * meow-memory v2 — 按窗口夜间整理（dream）。
  *
- * 用户拍板（2026-08-15）：
+ * 用户拍板（2026-08-15 原始设计 + 2026-08-19 改版）：
  * - 每个 session 窗口由它自己的主 agent 整理：只发本窗口（source_session）建立的
- *   project/topic/fact/lesson 记忆（不含 soul/user），对着自己的完整对话上下文整理。
- * - 按 project 分组逐轮处理（每轮一个项目域，注意力友好）；无 project 标签的最后统一一轮。
- * - 组内排序：project → level（project→topic→fact→lesson）→ 创建时间。
+ *   七层记忆（soul/user/project/fact/lesson/topic/rules），对着自己的完整对话上下文整理。
+ * - 2026-08-19 改版（用户拍板）：① 不再按 project 逐轮——所有 project 混在同一轮，
+ *   用【project：xxx】小标题分段，最后一段【project：无项目 - 全局信息，或缺少项目标签】；
+ *   ② 固定两轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），
+ *   第 2 轮=topic 记忆，空轮跳过（轮数动态，消息显示"第 N/M 组"）；③ 记忆范围=本窗口
+ *   建立的 ∪ 本窗口提取过的（sessions/<id>.json 的 injected+searched）；④ 条目展示
+ *   绝对时间戳（最后更新时间）；组内排序 project → level → 创建时间不变。
  * - T = dream 开始前窗口最后一轮正常对话时间（先记死）；收尾时该窗口所有条目
  *   updated_at = T（"记忆时间戳"=最后更新时间），windows 表 last_dream_time = T。
  * - 判定：窗口最后事件时间 > 24h 前 且 > 上次 dream 时间 → 需要 dream。
@@ -20,7 +24,8 @@ import { createUserMessage, type MessageSource } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { getDb, type Level, type MemoryRow } from './db.js'
+import { getDb, projectList, type Level, type MemoryRow } from './db.js'
+import { readSeen } from './inject.js'
 import { workspaceOf } from './tools.js'
 
 const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'meow-memory' }
@@ -44,36 +49,70 @@ function dreamLog(ws: string, dir: string, msg: string): void {
 
 // ── 分组与快照 ──────────────────────────────────────────────────────────────
 
-const LEVEL_ORDER: Record<Level, number> = { project: 0, topic: 1, fact: 2, lesson: 3, soul: 4, user: 5 }
+const LEVEL_ORDER: Record<Level, number> = { project: 0, topic: 1, fact: 2, lesson: 3, rules: 4, soul: 5, user: 6 }
 
 export interface DreamGroup {
-  name: string // 项目名；'' = 无项目标签
+  name: string // project 名；'' = 无项目标签
   rows: MemoryRow[]
 }
 
-/** 取窗口自己的记忆并按 project 分组（组内 project→topic→fact→lesson→时间）。 */
-export function groupWindowMemories(db: ReturnType<typeof getDb>, sessionId: string): DreamGroup[] {
-  const rows: MemoryRow[] = []
-  for (const level of ['project', 'topic', 'fact', 'lesson'] as Level[]) {
-    rows.push(...db.list(level).filter((r) => r.source_session === sessionId))
-  }
-  rows.sort((a, b) => {
-    const p = (a.project ?? '').localeCompare(b.project ?? '')
-    if (p !== 0) return p
-    const l = LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level]
-    if (l !== 0) return l
-    return a.created_at - b.created_at
-  })
-  const groups = new Map<string, DreamGroup>()
+/** 一轮 = 一种记忆类型（原子 / topic），内部按 project 小标题分段。 */
+export interface DreamRound {
+  kind: 'atomic' | 'topic'
+  groups: DreamGroup[]
+}
+
+/** 绝对时间戳（UTC 分钟级，与封存时间戳一致）。 */
+function formatTime(t: number): string {
+  return new Date(t).toISOString().slice(0, 16).replace('T', ' ')
+}
+
+/** 按 project 分组（组内 project→level→创建时间；"全局"/未标记归无项目段放最后；多值（逗号分隔）归第一个项目段）。 */
+function groupByProject(rows: MemoryRow[]): DreamGroup[] {
+  const byProject = new Map<string, MemoryRow[]>()
   for (const r of rows) {
-    const key = r.project ?? ''
-    if (!groups.has(key)) groups.set(key, { name: key, rows: [] })
-    groups.get(key)!.rows.push(r)
+    const list = projectList(r.project)
+    const key = list.length > 0 ? list[0] : ''
+    if (!byProject.has(key)) byProject.set(key, [])
+    byProject.get(key)!.push(r)
   }
-  // 无项目组放最后
-  return [...groups.entries()]
-    .sort((a, b) => (a[0] === '' ? 1 : b[0] === '' ? -1 : 0))
-    .map(([, g]) => g)
+  for (const list of byProject.values()) {
+    list.sort((a, b) => {
+      const l = LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level]
+      if (l !== 0) return l
+      return a.created_at - b.created_at
+    })
+  }
+  return [...byProject.entries()]
+    .sort((a, b) => (a[0] === '' ? 1 : b[0] === '' ? -1 : a[0].localeCompare(b[0])))
+    .map(([name, rows]) => ({ name, rows }))
+}
+
+/** dream 记忆范围（用户拍板 2026-08-19）：本窗口建立的 ∪ 本窗口提取过的
+ *  （sessions/<id>.json 的 injected+searched，readSeen）。
+ *  分两轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic）；
+ *  第 2 轮=topic 记忆。空轮跳过（轮数动态 1 或 2，消息里显示"第 N/M 组"）。 */
+export function collectDreamRounds(
+  db: ReturnType<typeof getDb>,
+  sessionId: string,
+  workspace: string,
+  dir = '.dsh-meow',
+): DreamRound[] {
+  const seen = readSeen(workspace, sessionId, dir)
+  const atomic: MemoryRow[] = []
+  const topic: MemoryRow[] = []
+  for (const level of ['project', 'fact', 'lesson', 'rules', 'soul', 'user'] as const) {
+    for (const r of db.list(level)) {
+      if (r.source_session === sessionId || seen.has(r.id)) atomic.push(r)
+    }
+  }
+  for (const r of db.list('topic')) {
+    if (r.source_session === sessionId || seen.has(r.id)) topic.push(r)
+  }
+  const rounds: DreamRound[] = []
+  if (atomic.length > 0) rounds.push({ kind: 'atomic', groups: groupByProject(atomic) })
+  if (topic.length > 0) rounds.push({ kind: 'topic', groups: groupByProject(topic) })
+  return rounds
 }
 
 function formatRow(r: MemoryRow): string {
@@ -82,44 +121,93 @@ function formatRow(r: MemoryRow): string {
   if (r.level === 'project' && r.subcategory) meta.push(r.subcategory)
   if (r.title) meta.push(`《${r.title}》`)
   if (r.status !== 'active') meta.push(r.status)
-  return `- [${meta.join(' ')} ${r.id.slice(0, 8)}] ${head}`
+  meta.push(`${r.id} ${formatTime(r.updated_at)}`) // 完整 id + 绝对时间戳（最后更新时间）
+  // 关键词行：AI 要核查/重写关键词（判断 6），必须先把现有关键词给它看。
+  const kw = (r.keywords ?? []).filter((k) => typeof k === 'string' && k.length > 0)
+  const kwLine = kw.length > 0 ? kw.join(', ') : '（无）'
+  return `- [${meta.join(' ')}] ${head}\n  关键词: ${kwLine}`
 }
 
-const DREAM_RULES = [
-  '规则：',
-  '1. 可新增（memory_remember）、修改（memory_update）、标状态（memory_update 设 status：stale=完结（todo 完成、话题达成目标 → stale 视为 done）；archived=删除（过时作废、重复、被替代的旧版本）；其他情况保持 active 不改标）；',
-  '2. 用户提供的信息尽量保留用户原话——原话里包含用户的潜在逻辑，很珍贵；',
-  '3. 过时、重复、不再需要的条目 → 设 status=archived（删除）；',
-  '4. 互相矛盾的条目 → 按事实修改（保留最新事实，旧版本标 archived）；',
-  '5. 核查 importance：重要决策/红线/教训 → 2 或 3；琐碎 → 1；',
-  '6. 有变更的信息要及时更新：本窗口对话里用户改变的说法/决定、项目或话题的新进展，都要更新到对应条目；topic 重写【经过/结果】段；project 的 todo 子类完成 → 标 stale（视为 done）；话题达成目标完结 → 标 stale；',
-  '7. topic 创建/更新必须带 project 参数（所属项目名）；',
-  '8. 写/改记忆时，同时总结该记忆的关键词（提取 5-10 个内容词，如"记忆插件"；别提取虚词），随 memory_remember/memory_update 的 keywords 参数提交；',
-  '9. rules（设计原则/行为准则）：全局准则不填 project 且 importance≥2 才会全量注入首轮，别把具体踩坑当 rules 写（踩坑进 lesson）；',
-  '10. 改动前若怀疑重复，先 memory_find_similar 查重；',
-  '11. 完成后直接回复"本组整理完成"，不要调用其他工具。',
-].join('\n')
+/** 第 1 轮（原子记忆）指南（用户拍板 2026-08-19 终稿）。 */
+const ATOMIC_GUIDE = [
+  '这些是你自己建立的记忆条目，以及你更新过的记忆。有没有你认为该整理、更新的？如有，请更新它。',
+  '顺便检查历史记录中所有你看到的记忆条目，有没有你认为该更新的，如有，请一并更新。',
+  '',
+  '## 如何判断该更新——回看之前建立和读到的记忆，你现在觉得：',
+  '1. 有没有当时记录错误或片面、过时、信息需要更新、用户改变决定、已有新进展的条目？ → 请及时更新内容，记忆库的信息应该吻合project进展的最新状态。',
+  '2. 有没有已完成的 todo 条目？ → 设 status = stale（视为done）；',
+  '3. 有没有错误的、过于琐碎、你现在看它根本不重要的条目？ → 设 status=archived；',
+  '4. 有没有曾经的bug已被修复，曾经的lesson已不再适用？ → 修改内容，或者设 status=archived；',
+  '5. 有没有发现互相矛盾的条目？ → 按你所知道的事实修改。保留最新事实，旧版本设 status=archived；',
+  '6. 现在回头去看，那些记忆的 importance 标记是否正确（按记忆系统 importance 准则核查）；',
+  '7. 有没有哪条记忆太长，信息太多？→ 拆分成多条，可用update修改，或remember新建新条目。',
+  '8. 记忆的关键词是否准确？→ 如果准确就不使用keywords参数，如果你觉得关键词不准，请使用memory_update的keywords参数更新它——当用户prompt命中某条记忆的关键词，它就会被提取。所以你需要反向思考，"你希望在用户prompt提及哪些词的时候，这条记忆被检索到？"以此作为关键词的写入标准。不要用项目名当关键词，用更加针对这条记忆本身的信息作为关键词。优先提取核心实体、语义中心、专有名词。8-13个。',
+  '9. project标签是否准确？是否有些信息应该是全局信息但被错误的标记了project？那应该删去project标记。是否有些信息明明属于某个project，却没写project信息？那应该加上。',
+  '10. 学而不思则罔，更多抽象泛化：',
+  '- 这是总结抽象框架的极好时机，你看看有没有可以总结沉淀的通用规则？可添加新记忆。',
+  '- 你现在对某些记忆条目可能有更好更深刻地理解，你可以更新他们。',
+  '11. 看一下首轮注入的内容，你现在觉得那些内容都重要吗？有必要每个session首轮注入吗？如果有不重要的，你可以降低他们的importance或者将他们移动到其他level（比如fact）。',
+  '首轮只注入：soul（AI 自身）/ user（用户偏好）/ 全局 rules（importance≥2）。想加入首轮：全局规则类 → 移入 rules 且 importance≥2（project 填"全局"）；用户相关 → 移入 user；AI 自身 → 移入 soul。',
+  '12. memory_project 展示的是 project 层条目（todo 已完成只列最近 5 条）+ 项目特定 rules；上面的检查同样适用（todo 完成标 stale、过时标 archived、project 标签准确）。',
+  '',
+  '说明：',
+  '对于你认为非常重要的记忆，如果不确定事实到底如何，你可以直接翻项目文件来核实。仅对非常重要的记忆使用。',
+  '完成后直接回复"本组整理完成"，不要调用其他工具。',
+]
 
-/** 构造一组 dream 指令消息。 */
+/** 第 2 轮（topic）开头介绍段（在【本组记忆】之前）。 */
+const TOPIC_INTRO = [
+  'topic是一种特殊的记忆，它追踪一个话题的起因经过发展结果，为AI提供更全局的、事件发展的视野。',
+  '一个topic只说一件事的前因后果发展脉络，依然要求信息要聚焦在这一件事上，不可跑题。',
+  '如果一个topic的事件链太长、细节太多，你也可以将其拆分成更小的事件。',
+  '如果你发现有不同的topic条目在说同一件事，可以将它们合并。',
+  '如果你发现有topic记录混乱，比如一件事的前因在topic A，后果在topic B，但topic A和B分别还有其他乱七八糟的信息，你应该综合考虑这些事情发展脉络，将它们整理清楚。用最合理最清楚的方式把这些信息分解成几件事、几条发展脉络，每件事一个topic。',
+]
+
+/** 第 2 轮（topic 记忆）更新指导（用户拍板 2026-08-19 终稿）。 */
+const TOPIC_GUIDE = [
+  '# topic记忆更新指导：',
+  '1. 请你根据最新信息判断，这些topic中描述的事情，他们有新的发展、新的重要信息吗？请及时更新。你可以重新起草topic，将该话题的新进展加入，旧信息点如果你认为不再重要，可以删减。',
+  '2. 有没有哪些topic说的太庞杂跑题了，如果提了好几件事，你认为应该拆分，你可以把一个大topic拆成几个子topic（新建topic）。',
+  '3. 有没有哪几个topic其实在说同一件事，应该合并？请你合并。',
+  '4. 有没有哪几个topic信息交叉混乱，你认为应该将它们的信息合并后重新拆分，这样才能更清晰的分割成两件事？请你重写他们。',
+  '5. 更新topic时，你依然需要反向思考，"我写这条topic记忆是为了提供哪些信息？别人看到这条topic能看明白这个话题/事件的发展脉络吗？"',
+  '6. 写/改topic时，同时总结该topic记忆的关键词（提取 8-13 个内容词供检索；"你希望在用户提及什么关键词时，AI能看到这条记忆"）。',
+  '7. 要记录project信息（project名，或全局）、importance。',
+  '8. 对于你认为非常重要的topic，如果不确定事实到底如何，你可以直接翻项目文件来核实。仅对非常重要的记忆使用。',
+  '9. 完成后直接回复"本组整理完成"，不要调用其他工具。',
+]
+
+/** 构造一轮 dream 指令消息（两轮共用头部：封存时间戳 + 时间戳规则）。 */
 export function buildDreamMessage(
   db: ReturnType<typeof getDb>,
   sessionId: string,
   T: number,
-  groups: DreamGroup[],
+  rounds: DreamRound[],
   idx: number,
 ): ReturnType<typeof createUserMessage> {
-  const group = groups[idx]
-  const tLabel = new Date(T).toISOString().slice(0, 16).replace('T', ' ')
-  const title = group.name === '' ? '（无项目标签的记忆）' : `项目「${group.name}」`
-  const lines = [
-    `${DREAM_MARKER} 记忆整理任务（dream）第 ${idx + 1}/${groups.length} 组：${title}`,
-    `本窗口记忆封存到：${tLabel}（之后其他窗口的进展本窗口不知道，冲突以记忆时间戳最新为准）。`,
+  const round = rounds[idx]
+  const lines: string[] = [
+    `${DREAM_MARKER} 记忆整理任务（dream）`,
     '',
-    `【本组记忆】（${group.rows.length} 条，按 project→level→时间排序）：`,
-    ...group.rows.map(formatRow),
+    `本窗口记忆封存时间戳：${formatTime(T)}`,
+    '如果其他窗口在此时间戳之后有新进展，你是不知道的。所以如果遇到记忆和你所知的上下文冲突，你需要根据时间戳来判断，是那条记忆错了，还是你信息落后了，来考虑要不要修改它。',
     '',
-    DREAM_RULES,
+    '时间戳规则：',
+    '所有展示给你的时间戳，都是那条记忆的**最后更新**时间戳。',
+    '因为你现在看到的是很长时间的完整上下文，所以"几小时前"这种相对时间戳其实一直在变，不值得参考。此时你需要看的是绝对时间戳来判断记忆信息的新旧。',
+    '',
+    '',
+    `第 ${idx + 1}/${rounds.length} 组 - ${round.kind === 'topic' ? 'topic记忆条目' : '原子记忆条目'}`,
+    '',
   ]
+  if (round.kind === 'topic') lines.push(...TOPIC_INTRO, '')
+  lines.push('【本组记忆】：')
+  for (const g of round.groups) {
+    lines.push('', `【project：${g.name === '' ? '无项目 - 全局信息，或缺少项目标签' : g.name}】`)
+    for (const r of g.rows) lines.push(formatRow(r))
+  }
+  lines.push('', ...(round.kind === 'topic' ? TOPIC_GUIDE : ATOMIC_GUIDE))
   return createUserMessage({ content: [{ type: 'text', text: lines.join('\n') }], source: PLUGIN_SOURCE })
 }
 
@@ -167,9 +255,9 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   const sessionId = agent.session?.header?.id
   if (!sessionId) return false
   const db = getDb(workspace, dir)
-  const groups = groupWindowMemories(db, sessionId)
-  if (groups.length === 0) {
-    // 无本窗口记忆：也推进 last_dream_time（= 本窗口无可整理），避免 need=true 恒成立、每轮空扫到 24h
+  const rounds = collectDreamRounds(db, sessionId, workspace, dir)
+  if (rounds.length === 0) {
+    // 无本窗口记忆（建立的 ∪ 提取过的都无）：也推进 last_dream_time（= 本窗口无可整理），避免 need=true 恒成立、每轮空扫到 24h
     db.finishDream(sessionId, Date.now())
     dreamLog(workspace, dir, `dream skip-empty sid=${shortSessionId(sessionId)}`)
     return false
@@ -178,9 +266,9 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   // claimDream 的 INSERT OR IGNORE 会给新窗口行造出 last_event_time=0 哨兵，这里兜底 0
   const T = win && win.last_event_time > 0 ? win.last_event_time : Date.now()
   if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
-  const msg = buildDreamMessage(db, sessionId, T, groups, 0)
+  const msg = buildDreamMessage(db, sessionId, T, rounds, 0)
   ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-  dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} groups=${groups.length} T=${T}`)
+  dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
   return true
 }
 
@@ -204,19 +292,19 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow'): void {
     return
   }
 
-  const groups = groupWindowMemories(db, sessionId) // 重查：前序组 archive/merge 已落地
+  const rounds = collectDreamRounds(db, sessionId, ws, dir) // 重查：前序轮 archive/merge 已落地
   const nextIdx = lease.group_idx + 1
-  if (nextIdx < groups.length) {
+  if (nextIdx < rounds.length) {
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
     if (db.advanceDreamLease(sessionId, lease.group_idx, DREAM_LEASE_MS)) {
-      const msg = buildDreamMessage(db, sessionId, lease.T, groups, nextIdx)
+      const msg = buildDreamMessage(db, sessionId, lease.T, rounds, nextIdx)
       ;(agent as { steer?: (m: unknown) => void }).steer?.(msg)
-      dreamLog(ws, dir, `dream group ${nextIdx + 1}/${groups.length} steered`)
+      dreamLog(ws, dir, `dream group ${nextIdx + 1}/${rounds.length} steered`)
     }
     return
   }
-  // 最后一组完成 → 收尾
-  finalizeDream(db, sessionId, ws, dir, lease.T, 'done', groups.length)
+  // 最后一轮完成 → 收尾
+  finalizeDream(db, sessionId, ws, dir, lease.T, 'done', rounds.length)
 }
 
 /** 收尾：封存全部条目（updated_at=T）+ 清租约 + 记 last_dream_time。失败不阻塞（日志兜底）。 */
@@ -251,7 +339,7 @@ export function abortDream(agent: unknown, dir = '.dsh-meow'): void {
 export function dreamTool(ctx: Context, dir = '.dsh-meow'): ToolDefinition {
   return {
     name: 'memory_dream',
-    description: '立即为本窗口安排一次记忆整理（dream）：把本窗口建立的记忆按项目分组逐轮发给主 agent 整理封存。通常夜间自动运行，此工具用于手动触发。',
+    description: '立即为本窗口安排一次记忆整理（dream）：把本窗口建立过/提取过的记忆分两轮发给主 agent 整理封存（第 1 轮=原子记忆 project/fact/lesson/rules/soul/user，第 2 轮=topic 记忆）。通常夜间自动运行，此工具用于手动触发。',
     parameters: {
       type: 'object',
       additionalProperties: false,

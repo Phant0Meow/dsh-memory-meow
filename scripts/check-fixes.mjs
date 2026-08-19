@@ -1,0 +1,11 @@
+import { readFileSync } from 'node:fs'
+const idx = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+console.log('index.js len:', idx.length)
+console.log('has ctx.get("agents") fix (agentsSvc):', idx.includes('agentsSvc'))
+console.log('has bad ctx.agents?.get:', idx.includes('ctx.agents?.get'))
+console.log('has claimDream:', idx.includes('claimDream'))
+console.log('has claimCheckGate:', idx.includes('claimCheckGate'))
+const cli = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+console.log('client.js len:', cli.length)
+console.log('client id quoted:', cli.includes('id: "meow-memory"'))
+console.log('client ModuleLoader load:', cli.includes('window.__ModuleLoader__.load({'))

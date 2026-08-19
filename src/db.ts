@@ -49,12 +49,31 @@ export function relativeTime(ms: number | null | undefined): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
+/** project 字段 → 项目名列表（逗号分隔多值，兼容单值；'全局'/空 = 无具体项目）。 */
+export function projectList(field: string | null): string[] {
+  if (!field || field === '全局') return []
+  return field.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+}
+
+/** project 字段是否覆盖某项目名（多值包含判断；null/'全局' = 全局适用任何项目）。 */
+export function projectCovers(field: string | null, name: string): boolean {
+  if (field === null || field === '全局') return true
+  return projectList(field).includes(name)
+}
+
+/** project 字段的展示标签：'全局'=真全局；null=未标记；多值 join '/'（如 dsh/femwa）。 */
+export function projectLabel(field: string | null): string {
+  if (field === '全局') return '全局'
+  if (field === null) return '未标记'
+  return projectList(field).join('/')
+}
+
 export interface MemoryRow {
   id: string
   level: Level
   title: string | null
   content: string
-  importance: number // 0..3，3=超级重要（豁免遗忘权重）
+  importance: number // 数字即可不设上限（软引导 1-4；高 importance 豁免遗忘权重）
   keywords: string[] // JSON 数组，写入时 bigram 自动提取
   status: Status
   corrected: number // lesson 专用：来自用户纠正
@@ -346,13 +365,13 @@ export class MemoryDb {
     return row.n
   }
 
-  /** 全部出现过（含已过时）的项目名：project/fact/lesson/topic/rules 五表的 project 列并集。
-   *  供记忆导引列出"用户的所有 project"（动态派生，无需手工维护）。 */
+  /** 全部出现过（含已过时）的项目名：project/fact/lesson/topic/rules 五表的 project 列并集
+   *  （多值逗号分隔展开；"全局"是全局标记不是项目，排除）。供记忆导引列出"用户的所有 project"。 */
   listProjectNames(): string[] {
     const names = new Set<string>()
     for (const level of ['project', 'fact', 'lesson', 'topic', 'rules'] as const) {
       const rows = this.db.prepare(`SELECT project FROM ${level} WHERE project IS NOT NULL AND project != ''`).all() as Array<{ project: string }>
-      for (const r of rows) names.add(r.project)
+      for (const r of rows) for (const n of projectList(r.project)) names.add(n)
     }
     return [...names].sort((a, b) => a.localeCompare(b))
   }
